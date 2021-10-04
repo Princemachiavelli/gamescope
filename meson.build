@@ -45,8 +45,6 @@ sdl_dep = dependency('SDL2')
 pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'))
 librt_dep = cppc.find_library('rt', required : get_option('pipewire'))
 
-stb_dep = dependency('stb')
-
 wlroots_dep = dependency(
   'wlroots',
   version: ['>= 0.15.0', '< 0.16.0'],
@@ -140,7 +138,7 @@ executable(
     dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
     dep_xxf86vm, dep_xres, drm_dep, wayland_server, wayland_protos,
     xkbcommon, thread_dep, sdl_dep, wlroots_dep,
-    vulkan_dep, liftoff_dep, dep_xtst, cap_dep, pipewire_dep, librt_dep, stb_dep,
+    vulkan_dep, liftoff_dep, dep_xtst, cap_dep, pipewire_dep, librt_dep
   ],
   install: true,
 )
