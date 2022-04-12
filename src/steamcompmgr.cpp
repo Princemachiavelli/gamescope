@@ -153,7 +153,7 @@ struct win {
 	unsigned int requestedWidth;
 	unsigned int requestedHeight;
 	bool is_dialog;
-	bool maybe_an_override;
+	bool maybe_a_dropdown;
 
 	Window transientFor;
 
@@ -242,6 +242,8 @@ BlurMode g_BlurModeOld = BLUR_MODE_OFF;
 unsigned int g_BlurFadeDuration = 0;
 int g_BlurRadius = 5;
 unsigned int g_BlurFadeStartTime = 0;
+
+pid_t focusWindow_pid;
 
 bool steamcompmgr_window_should_limit_fps( win *w )
 {
@@ -1705,7 +1707,7 @@ paint_all()
 
 	bool bCapture = takeScreenshot || pw_buffer != nullptr;
 
-	int nTargetRefresh = g_nSteamCompMgrTargetFPS && g_nDynamicRefreshRate && steamcompmgr_window_should_limit_fps( global_focus.focusWindow ) && !global_focus.overlayWindow
+	int nTargetRefresh = g_nSteamCompMgrTargetFPS && g_nDynamicRefreshRate && steamcompmgr_window_should_limit_fps( global_focus.focusWindow )// && !global_focus.overlayWindow
 		? g_nDynamicRefreshRate
 		: drm_get_default_refresh( &g_DRM );
 
@@ -1952,15 +1954,32 @@ win_has_game_id( win *w )
 }
 
 static bool
+win_is_useless( win *w )
+{
+	// Windows that are 1x1 are pretty useless for override redirects.
+	// Just ignore them.
+	// Fixes the Xbox Login in Age of Empires 2: DE.
+	return w->a.width == 1 && w->a.height == 1;
+}
+
+static bool
 win_is_override_redirect( win *w )
 {
-	return w->a.override_redirect && !w->ignoreOverrideRedirect;
+	return w->a.override_redirect && !w->ignoreOverrideRedirect && !win_is_useless( w );
 }
 
 static bool
 win_skip_taskbar_and_pager( win *w )
 {
 	return w->skipTaskbar && w->skipPager;
+}
+
+static bool
+win_maybe_a_dropdown( win *w )
+{
+	bool valid_maybe_a_dropdown =
+		w->maybe_a_dropdown && ( ( !w->is_dialog || win_skip_taskbar_and_pager( w ) ) && ( w->skipPager || w->skipTaskbar ) );
+	return ( valid_maybe_a_dropdown || win_is_override_redirect( w ) ) && !win_is_useless( w );
 }
 
 /* Returns true if a's focus priority > b's.
@@ -1987,16 +2006,31 @@ is_focus_priority_greater( win *a, win *b )
 	if ( win_is_override_redirect( a ) != win_is_override_redirect( b ) )
 		return !win_is_override_redirect( a );
 
+	// If the window is 1x1 then prefer anything else we have.
+	if ( win_is_useless( a ) != win_is_useless( b ) )
+		return !win_is_useless( a );
+
+	if ( win_maybe_a_dropdown( a ) != win_maybe_a_dropdown( b ) )
+		return !win_maybe_a_dropdown( a );
+
 	// Wine sets SKIP_TASKBAR and SKIP_PAGER hints for WS_EX_NOACTIVATE windows.
 	// See https://github.com/Plagman/gamescope/issues/87
 	if ( win_skip_taskbar_and_pager( a ) != win_skip_taskbar_and_pager( b ) )
 		return !win_skip_taskbar_and_pager( a );
 
 	// Prefer normal windows over dialogs
-	// if we are an override redirect.
-	if ( win_is_override_redirect( a ) == win_is_override_redirect( b ) &&
-		a->is_dialog != b->is_dialog && b->is_dialog )
-		return true;
+	// if we are an override redirect/dropdown window.
+	if ( win_maybe_a_dropdown( a ) && win_maybe_a_dropdown( b ) &&
+		a->is_dialog != b->is_dialog )
+		return !a->is_dialog;
+
+	// Attempt to tie-break dropdowns by transient-for.
+	if ( win_maybe_a_dropdown( a ) && win_maybe_a_dropdown( b ) &&
+		!a->transientFor != !b->transientFor )
+		return !a->transientFor;
+
+	if ( win_has_game_id( a ) && a->map_sequence != b->map_sequence )
+		return a->map_sequence > b->map_sequence;
 
 	// The damage sequences are only relevant for game windows.
 	if ( win_has_game_id( a ) && a->damage_sequence != b->damage_sequence )
@@ -2010,7 +2044,10 @@ static bool is_good_override_candidate( win *override, win* focus )
 	// Some Chrome/Edge dropdowns (ie. FH5 xbox login) will automatically close themselves if you
 	// focus them while they are meant to be offscreen (-1,-1 and 1x1) so check that the
 	// override's position is on-screen.
-	return win_is_override_redirect(override) && override != focus && override->a.x > 0 && override->a.y > 0;
+	if ( !focus )
+		return false;
+
+	return override != focus && override->a.x >= 0 && override->a.y >= 0;
 } 
 
 static bool
@@ -2060,7 +2097,7 @@ found:;
 		}
 	}
 
-	auto resolveTransientOverrides = [&]()
+	auto resolveTransientOverrides = [&](bool maybe)
 	{
 		// Do some searches to find transient links to override redirects too.
 		while ( true )
@@ -2069,9 +2106,10 @@ found:;
 
 			for ( win *candidate : vecPossibleFocusWindows )
 			{
+				bool is_dropdown = maybe ? win_maybe_a_dropdown( candidate ) : win_is_override_redirect( candidate );
 				if ( ( !override_focus || candidate != override_focus ) && candidate != focus &&
 					( ( !override_focus && candidate->transientFor == focus->id ) || ( override_focus && candidate->transientFor == override_focus->id ) ) &&
-					candidate->a.override_redirect )
+					 is_dropdown)
 				{
 					bFoundTransient = true;
 					override_focus = candidate;
@@ -2094,7 +2132,7 @@ found:;
 
 			for ( win *candidate : vecPossibleFocusWindows )
 			{
-				if ( candidate != focus && candidate->transientFor == focus->id && !candidate->a.override_redirect )
+				if ( candidate != focus && candidate->transientFor == focus->id && !win_maybe_a_dropdown( candidate ) )
 				{
 					bFoundTransient = true;
 					focus = candidate;
@@ -2106,8 +2144,6 @@ found:;
 			if ( bFoundTransient == false )
 				break;
 		}
-
-		resolveTransientOverrides();
 	}
 
 	if ( !override_focus && focus )
@@ -2116,7 +2152,7 @@ found:;
 		{
 			for ( win *override : vecPossibleFocusWindows )
 			{
-				if ( is_good_override_candidate(override, focus) && override->appID == focus->appID ) {
+				if ( win_is_override_redirect(override) && is_good_override_candidate(override, focus) && override->appID == focus->appID ) {
 					override_focus = override;
 					break;
 				}
@@ -2126,14 +2162,14 @@ found:;
 		{
 			for ( win *override : vecPossibleFocusWindows )
 			{
-				if ( is_good_override_candidate(override, focus) ) {
+				if ( win_is_override_redirect(override) && is_good_override_candidate(override, focus) ) {
 					override_focus = override;
 					break;
 				}
 			}
 		}
 
-		resolveTransientOverrides();
+		resolveTransientOverrides( false );
 	}
 
 	if ( focus )
@@ -2153,19 +2189,19 @@ found:;
 			out->focusWindow = focus;
 	}
 
-	if ( !override_focus )
+	if ( !override_focus && focus )
 	{
 		if ( controlledFocus )
 		{
 			for ( auto focusable_appid : ctxFocusControlAppIDs )
 			{
-				for ( win *focusable_window : vecPossibleFocusWindows )
+				for ( win *fake_override : vecPossibleFocusWindows )
 				{
-					if ( focusable_window->appID == focusable_appid )
+					if ( fake_override->appID == focusable_appid )
 					{
-						if ( focusable_window->maybe_an_override && win_skip_taskbar_and_pager( focusable_window ) )
+						if ( win_maybe_a_dropdown( fake_override ) && is_good_override_candidate( fake_override, focus ) && fake_override->appID == focus->appID )
 						{
-							override_focus = focusable_window;
+							override_focus = fake_override;
 							goto found2;
 						}
 					}
@@ -2174,18 +2210,18 @@ found:;
 		}
 		else
 		{
-			for ( win *focusable_window : vecPossibleFocusWindows )
+			for ( win *fake_override : vecPossibleFocusWindows )
 			{
-				if ( focusable_window->maybe_an_override && win_skip_taskbar_and_pager( focusable_window ) )
+				if ( win_maybe_a_dropdown( fake_override ) && is_good_override_candidate( fake_override, focus ) )
 				{
-					override_focus = focusable_window;
+					override_focus = fake_override;
 					goto found2;
 				}
 			}	
 		}
 		
 		found2:;
-		resolveTransientOverrides();
+		resolveTransientOverrides( true );
 	}
 
 	out->overrideWindow = override_focus;
@@ -2403,7 +2439,7 @@ determine_and_apply_focus(xwayland_ctx_t *ctx, std::vector<win*>& vecGlobalPossi
 
 	while (i < nchildren)
 	{
-		XSelectInput( ctx->dpy, children[i], PointerMotionMask | FocusChangeMask );
+		XSelectInput( ctx->dpy, children[i], FocusChangeMask );
 		i++;
 	}
 
@@ -2444,9 +2480,9 @@ determine_and_apply_focus()
 
 	for ( win *focusable_window : vecPossibleFocusWindows )
 	{
-		// Exclude windows that are 1x1, skip taskbar + pager or override redirect windows
+		// Exclude windows that are useless (1x1), skip taskbar + pager or override redirect windows
 		// from the reported focusable windows to Steam.
-		if ( ( focusable_window->a.width == 1 && focusable_window->a.height == 1 ) ||
+		if ( win_is_useless( focusable_window ) ||
 			win_skip_taskbar_and_pager( focusable_window ) ||
 			focusable_window->a.override_redirect )
 			continue;
@@ -2568,6 +2604,7 @@ determine_and_apply_focus()
 		focusedBaseAppId = global_focus.focusWindow->appID;
 		focusedAppId = global_focus.inputFocusWindow->appID;
 		focused_display = global_focus.focusWindow->ctx->xwayland_server->get_nested_display_name();
+		focusWindow_pid = global_focus.focusWindow->pid;
 	}
 
 	if ( global_focus.inputFocusWindow )
@@ -2672,14 +2709,15 @@ get_size_hints(xwayland_ctx_t *ctx, win *w)
 
 	XGetWMNormalHints(ctx->dpy, w->id, &hints, &hintsSpecified);
 
-	if (( hintsSpecified & (PPosition | PWinGravity) ) &&
-		hints.x && hints.y && hints.win_gravity == StaticGravity )
+	const bool bHasPositionAndGravityHints = ( hintsSpecified & ( PPosition | PWinGravity ) ) == ( PPosition | PWinGravity );
+	if ( bHasPositionAndGravityHints &&
+		 hints.x && hints.y && hints.win_gravity == StaticGravity )
 	{
-		w->maybe_an_override = true;
+		w->maybe_a_dropdown = true;
 	}
 	else
 	{
-		w->maybe_an_override = false;
+		w->maybe_a_dropdown = false;
 	}
 
 	if (hintsSpecified & (PMaxSize | PMinSize) &&
@@ -2809,7 +2847,7 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
 
 	/* This needs to be here or else we lose transparency messages */
 	XSelectInput(ctx->dpy, id, PropertyChangeMask | SubstructureNotifyMask |
-		PointerMotionMask | LeaveWindowMask | FocusChangeMask);
+		LeaveWindowMask | FocusChangeMask);
 
 	XFlush(ctx->dpy);
 
@@ -4496,15 +4534,6 @@ dispatch_x11( xwayland_ctx_t *ctx )
 					bShouldResetCursor = true;
 				}
 				break;
-			case MotionNotify:
-				{
-					win * w = find_win(ctx, ev.xmotion.window);
-					if (w && w == ctx->focus.inputFocusWindow)
-					{
-						cursor->move(ev.xmotion.x, ev.xmotion.y);
-					}
-					break;
-				}
 			default:
 				if (ev.type == ctx->damage_event + XDamageNotify)
 				{
