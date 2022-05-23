@@ -34,50 +34,6 @@ enum BlurMode {
     BLUR_MODE_ALWAYS = 2,
 };
 
-class CVulkanTexture;
-
-// These two structs are horrible
-struct VulkanPipeline_t
-{
-	struct LayerBinding_t
-	{
-		int surfaceWidth;
-		int surfaceHeight;
-
-		int imageWidth;
-		int imageHeight;
-		
-		std::shared_ptr<CVulkanTexture> tex;
-		uint32_t fbid;
-		
-		int zpos;
-
-		bool bFilter;
-	} layerBindings[ k_nMaxLayers ];
-};
-
-struct vec2_t
-{
-	float x, y;
-};
-
-struct Composite_t
-{
-	int nLayerCount;
-	int nYCBCRMask;
-	bool useFSRLayer0;
-	BlurMode blurLayer0;
-	int blurRadius;
-
-	struct CompositeData_t
-	{
-		vec2_t vScale[k_nMaxLayers];
-		vec2_t vOffset[k_nMaxLayers];
-		float flOpacity[k_nMaxLayers];
-		uint32_t nBorderMask;
-	} data;
-
-};
 
 #include "drm.hpp"
 
@@ -90,9 +46,7 @@ struct Composite_t
 extern "C" {
 #define static
 #include <wlr/render/dmabuf.h>
-#include <wlr/render/gles2.h>
 #include <wlr/render/interface.h>
-#include <wlr/render/egl.h>
 #undef static
 }
 
@@ -124,6 +78,7 @@ public:
 			bTransferSrc = false;
 			bTransferDst = false;
 			bLinear = false;
+			bExportable = false;
 		}
 
 		bool bFlippable : 1;
@@ -133,18 +88,31 @@ public:
 		bool bTransferSrc : 1;
 		bool bTransferDst : 1;
 		bool bLinear : 1;
+		bool bExportable : 1;
 	};
 
-	bool BInit( uint32_t width, uint32_t height, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr );
+	bool BInit( uint32_t width, uint32_t height, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0 );
 
-	inline VkImageView getView( bool linear )
-	{
-		return linear ? m_linearView : m_srgbView;
-	}
+	inline VkImageView view( bool linear ) { return linear ? m_linearView : m_srgbView; }
+	inline VkImageView linearView() { return m_linearView; }
+	inline VkImageView srgbView() { return m_srgbView; }
+	inline uint32_t width() { return m_width; }
+	inline uint32_t height() { return m_height; }
+	inline uint32_t contentWidth() {return m_contentWidth; }
+	inline uint32_t contentHeight() {return m_contentHeight; }
+	inline uint32_t rowPitch() { return m_unRowPitch; }
+	inline uint32_t fbid() { return m_FBID; }
+	inline void *mappedData() { return m_pMappedData; }
+	inline VkFormat format() { return m_format; }
+	inline const struct wlr_dmabuf_attributes& dmabuf() { return m_dmabuf; }
+	inline VkImage vkImage() { return m_vkImage; }
+
+	int memoryFence();
 
 	CVulkanTexture( void );
 	~CVulkanTexture( void );
-	
+
+private:
 	bool m_bInitialized = false;
 
 	VkImage m_vkImage = VK_NULL_HANDLE;
@@ -153,7 +121,12 @@ public:
 	VkImageView m_srgbView = VK_NULL_HANDLE;
 	VkImageView m_linearView = VK_NULL_HANDLE;
 
-	uint32_t m_width = 0, m_height = 0;
+	uint32_t m_width = 0;
+	uint32_t m_height = 0;
+
+	uint32_t m_contentWidth = 0;
+	uint32_t m_contentHeight = 0;
+
 	uint32_t m_unRowPitch = 0;
 	
 	uint32_t m_FBID = 0;
@@ -161,6 +134,63 @@ public:
 	void *m_pMappedData = nullptr;
 
 	VkFormat m_format = VK_FORMAT_UNDEFINED;
+
+	struct wlr_dmabuf_attributes m_dmabuf = {};
+};
+
+struct vec2_t
+{
+	float x, y;
+};
+
+struct FrameInfo_t
+{
+	bool useFSRLayer0;
+	bool useNISLayer0;
+	BlurMode blurLayer0;
+	int blurRadius;
+
+
+	int layerCount;
+	struct Layer_t
+	{
+		std::shared_ptr<CVulkanTexture> tex;
+		uint32_t fbid; // TODO pretty sure we can just move this into tex
+		int zpos;
+
+		vec2_t offset;
+		vec2_t scale;
+
+		float opacity;
+
+		bool blackBorder;
+		bool linearFilter;
+
+		uint32_t integerWidth() const { return tex->width() / scale.x; }
+		uint32_t integerHeight() const { return tex->height() / scale.y; }
+	} layers[ k_nMaxLayers ];
+
+	uint32_t borderMask() const {
+		uint32_t result = 0;
+		for (int i = 0; i < layerCount; i++)
+		{
+			if (layers[ i ].blackBorder)
+				result |= 1 << i;
+		}
+		return result;
+	}
+	uint32_t ycbcrMask() const {
+		uint32_t result = 0;
+		for (int i = 0; i < layerCount; i++)
+		{
+			if ( layers[ i ].tex )
+			{
+				if (layers[ i ].tex->format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+					result |= 1 << i;
+			}
+		}
+		return result;
+	}
 };
 
 extern bool g_vulkanSupportsModifiers;
@@ -175,14 +205,12 @@ bool vulkan_init_formats(void);
 bool vulkan_make_output(void);
 
 std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes *pDMA );
-std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
+std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf );
 
-uint32_t vulkan_texture_get_fbid( const std::shared_ptr<CVulkanTexture>& vulkanTex );
-int vulkan_texture_get_fence( const std::shared_ptr<CVulkanTexture>& vulkanTex );
-
-bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline, std::shared_ptr<CVulkanTexture> *pScreenshotTexture );
-uint32_t vulkan_get_last_composite_fbid( void );
+bool vulkan_composite( struct FrameInfo_t *frameInfo, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
+std::shared_ptr<CVulkanTexture> vulkan_get_last_output_image( void );
+std::shared_ptr<CVulkanTexture> vulkan_acquire_screenshot_texture(bool exportable);
 
 void vulkan_present_to_window( void );
 

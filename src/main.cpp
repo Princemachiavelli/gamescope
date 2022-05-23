@@ -7,6 +7,8 @@
 #include <cstring>
 #include <sys/capability.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #include <getopt.h>
 #include <signal.h>
@@ -38,6 +40,8 @@ const struct option *gamescope_options = (struct option[]){
 	{ "output-height", required_argument, nullptr, 'H' },
 	{ "nearest-neighbor-filter", no_argument, nullptr, 'n' },
 	{ "fsr-upscaling", no_argument, nullptr, 'U' },
+	{ "nis-upscaling", no_argument, nullptr, 'Y' },
+	{ "sharpness", required_argument, nullptr, 0 },
 	{ "fsr-sharpness", required_argument, nullptr, 0 },
 
 	// nested mode options
@@ -88,7 +92,8 @@ const char usage[] =
 	"  -H, --output-height            output height\n"
 	"  -n, --nearest-neighbor-filter  use nearest neighbor filtering\n"
 	"  -U  --fsr-upscaling            use AMD FidelityFX™ Super Resolution 1.0 for upscaling\n"
-	"  --fsr-sharpness                FSR sharpness from 0 (max) to 20 (min)\n"
+	"  -Y  --nis-upscaling            use NVIDIA Image Scaling v1.0.2 for upscaling\n"
+	"  --sharpness --fsr-sharpness    upscaler sharpness from 0 (max) to 20 (min)\n"
 	"  --cursor                       path to default cursor image\n"
 	"  -R, --ready-fd                 notify FD when ready\n"
 	"  -T, --stats-path               write statistics to path\n"
@@ -121,6 +126,7 @@ const char usage[] =
 	"  Super + F                      toggle fullscreen\n"
 	"  Super + N                      toggle nearest neighbour filtering\n"
 	"  Super + U                      toggle FSR upscaling\n"
+	"  Super + Y                      toggle NIS upscaling\n"
 	"  Super + I                      increase FSR sharpness by 1\n"
 	"  Super + O                      decrease FSR sharpness by 1\n"
 	"  Super + S                      take a screenshot\n"
@@ -142,8 +148,8 @@ bool g_bFullscreen = false;
 bool g_bIsNested = false;
 
 bool g_bFilterGameWindow = true;
-bool g_fsrUpscale = false;
-int g_fsrSharpness = 2;
+GamescopeUpscaler g_upscaler = GamescopeUpscaler::BLIT;
+int g_upscalerSharpness = 2;
 
 bool g_bBorderlessOutputWindow = false;
 
@@ -212,6 +218,51 @@ static void handle_signal( int sig )
 	}
 }
 
+static struct rlimit g_originalFdLimit;
+static bool g_fdLimitRaised = false;
+
+void restore_fd_limit( void )
+{
+	if (!g_fdLimitRaised) {
+		return;
+	}
+
+	if ( setrlimit( RLIMIT_NOFILE, &g_originalFdLimit ) )
+	{
+		fprintf( stderr, "Failed to reset the maximum number of open files in child process\n" );
+		fprintf( stderr, "Use of select() may fail.\n" );
+	}
+
+	g_fdLimitRaised = false;
+}
+
+static void raise_fd_limit( void )
+{
+	struct rlimit newFdLimit;
+
+	memset(&g_originalFdLimit, 0, sizeof(g_originalFdLimit));
+	if ( getrlimit( RLIMIT_NOFILE, &g_originalFdLimit ) != 0 )
+	{
+		fprintf( stderr, "Could not query maximum number of open files. Leaving at default value.\n" );
+		return;
+	}
+
+	if ( g_originalFdLimit.rlim_cur >= g_originalFdLimit.rlim_max )
+	{
+		return;
+	}
+
+	memcpy(&newFdLimit, &g_originalFdLimit, sizeof(newFdLimit));
+	newFdLimit.rlim_cur = newFdLimit.rlim_max;
+
+	if ( setrlimit( RLIMIT_NOFILE, &newFdLimit ) )
+	{
+		fprintf( stderr, "Failed to raise the maximum number of open files. Leaving at default value.\n" );
+	}
+
+	g_fdLimitRaised = true;
+}
+
 int g_nPreferredOutputWidth = 0;
 int g_nPreferredOutputHeight = 0;
 
@@ -265,7 +316,10 @@ int main(int argc, char **argv)
 				g_sOutputName = optarg;
 				break;
 			case 'U':
-				g_fsrUpscale = true;
+				g_upscaler = GamescopeUpscaler::FSR;
+				break;
+			case 'Y':
+				g_upscaler = GamescopeUpscaler::NIS;
 				break;
 			case 0: // long options without a short option
 				opt_name = gamescope_options[opt_index].name;
@@ -285,8 +339,9 @@ int main(int argc, char **argv)
 					g_nTouchClickMode = g_nDefaultTouchClickMode;
 				} else if (strcmp(opt_name, "generate-drm-mode") == 0) {
 					g_drmModeGeneration = parse_drm_mode_generation( optarg );
-				} else if (strcmp(opt_name, "fsr-sharpness") == 0) {
-					g_fsrSharpness = atoi( optarg );
+				} else if (strcmp(opt_name, "sharpness") == 0 ||
+						   strcmp(opt_name, "fsr-sharpness") == 0) {
+					g_upscalerSharpness = atoi( optarg );
 				}
 				break;
 			case '?':
@@ -325,6 +380,10 @@ int main(int argc, char **argv)
 	{
 		fprintf( stderr, "No CAP_SYS_NICE, falling back to regular-priority compute and threads.\nPerformance will be affected.\n" );
 	}
+
+	setenv( "XWAYLAND_FORCE_ENABLE_EXTRA_MODES", "1", 1 );
+
+	raise_fd_limit();
 
 	if ( gpuvis_trace_init() != -1 )
 	{

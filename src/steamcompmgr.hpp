@@ -48,8 +48,7 @@ public:
 	void constrainPosition();
 	void resetPosition();
 
-	void paint(struct win *window, struct win *fit, struct Composite_t *pComposite,
-			   struct VulkanPipeline_t *pPipeline);
+	void paint(struct win *window, struct win *fit, struct FrameInfo_t *frameInfo);
 	void setDirty();
 
 	// Will take ownership of data.
@@ -78,8 +77,6 @@ private:
 
 	int m_x = 0, m_y = 0;
 	int m_hotspotX = 0, m_hotspotY = 0;
-	int m_surfaceWidth = 0, m_surfaceHeight = 0;
-	int m_imageWidth = 0, m_imageHeight = 0;
 
 	std::shared_ptr<CVulkanTexture> m_texture;
 	bool m_dirty;

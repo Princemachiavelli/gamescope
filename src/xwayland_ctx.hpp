@@ -94,6 +94,7 @@ struct xwayland_ctx_t
 		Atom steamTouchClickModeAtom;
 		Atom utf8StringAtom;
 		Atom netWMNameAtom;
+		Atom motifWMHints;
 		Atom netSystemTrayOpcodeAtom;
 		Atom steamStreamingClientAtom;
 		Atom steamStreamingClientVideoAtom;
@@ -116,9 +117,11 @@ struct xwayland_ctx_t
 
 		Atom gamescopeScalingFilter;
 		Atom gamescopeFSRSharpness;
+		Atom gamescopeSharpness;
 
 		Atom gamescopeColorLinearGain;
 		Atom gamescopeColorGain;
+		Atom gamescopeColorMatrix;
 		Atom gamescopeColorLinearGainBlend;
 
 		Atom gamescopeXWaylandModeControl;

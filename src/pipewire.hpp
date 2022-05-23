@@ -16,7 +16,8 @@ struct pipewire_state {
 	uint32_t stream_node_id;
 	bool streaming;
 	struct spa_video_info_raw video_info;
-	int stride;
+	bool dmabuf;
+	int shm_stride;
 	uint64_t seq;
 };
 
@@ -26,10 +27,16 @@ struct pipewire_state {
  * push_pipewire_buffer) for copying.
  */
 struct pipewire_buffer {
+	enum spa_data_type type; // SPA_DATA_MemFd or SPA_DATA_DmaBuf
 	struct spa_video_info_raw video_info;
-	int stride;
-	uint8_t *data;
-	int fd;
+	std::shared_ptr<CVulkanTexture> texture;
+
+	// Only used for SPA_DATA_MemFd
+	struct {
+		int stride;
+		uint8_t *data;
+		int fd;
+	} shm;
 
 	// The following fields are not thread-safe
 
@@ -38,10 +45,6 @@ struct pipewire_buffer {
 	// We pass the buffer to the steamcompmgr thread for copying. This is set
 	// to true if the buffer is currently owned by the steamcompmgr thread.
 	bool copying;
-	// Once steamcompmgr has copied the buffer, it'll set this field to the
-	// copy. The PipeWire thread is responsible for downloading the buffer,
-	// then release it.
-	std::shared_ptr<CVulkanTexture> texture;
 };
 
 bool init_pipewire(void);

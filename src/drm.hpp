@@ -35,6 +35,8 @@ struct crtc {
 	drmModeCrtc *crtc;
 	std::map<std::string, const drmModePropertyRes *> props;
 	std::map<std::string, uint64_t> initial_prop_values;
+	bool has_gamma_lut;
+	bool has_ctm;
 
 	struct {
 		bool active;
@@ -96,8 +98,15 @@ struct drm_t {
 	struct {
 		uint32_t mode_id;
 		uint32_t gamma_lut_id;
+		uint32_t ctm_id;
 		float color_gain[3] = { 1.0f, 1.0f, 1.0f };
 		float color_linear_gain[3] = { 1.0f, 1.0f, 1.0f };
+		float color_mtx[9] =
+		{
+			1.0f, 0.0f, 0.0f,
+			0.0f, 1.0f, 0.0f,
+			0.0f, 0.0f, 1.0f,
+		};
 		float gain_blend = 0.0f;
 	} current, pending;
 
@@ -144,8 +153,8 @@ extern enum drm_mode_generation g_drmModeGeneration;
 
 bool init_drm(struct drm_t *drm, int width, int height, int refresh);
 void finish_drm(struct drm_t *drm);
-int drm_commit(struct drm_t *drm, struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline );
-int drm_prepare( struct drm_t *drm, const struct Composite_t *pComposite, const struct VulkanPipeline_t *pPipeline );
+int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo );
+int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo );
 void drm_rollback( struct drm_t *drm );
 bool drm_poll_state(struct drm_t *drm);
 uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct wlr_dmabuf_attributes *dma_buf );
@@ -158,8 +167,10 @@ bool drm_set_refresh( struct drm_t *drm, int refresh );
 bool drm_set_resolution( struct drm_t *drm, int width, int height );
 bool drm_set_color_linear_gains(struct drm_t *drm, float *gains);
 bool drm_set_color_gains(struct drm_t *drm, float *gains);
+bool drm_set_color_mtx(struct drm_t *drm, float *mtx);
 bool drm_set_color_gain_blend(struct drm_t *drm, float blend);
 bool drm_update_gamma_lut(struct drm_t *drm);
+bool drm_update_color_mtx(struct drm_t *drm);
 
 char *find_drm_node_by_devid(dev_t devid);
 int drm_get_default_refresh(struct drm_t *drm);
