@@ -268,7 +268,7 @@ uint64_t g_SteamCompMgrVBlankTime = 0;
 
 static int g_nSteamCompMgrTargetFPS = 0;
 static uint64_t g_uDynamicRefreshEqualityTime = 0;
-static int g_nDynamicRefreshRate = 0;
+static int g_nDynamicRefreshRate[DRM_SCREEN_TYPE_COUNT] = { 0, 0 };
 // Delay to stop modes flickering back and forth.
 static const uint64_t g_uDynamicRefreshDelay = 600'000'000; // 600ms
 
@@ -1734,8 +1734,10 @@ paint_all()
 
 	bool bCapture = takeScreenshot || pw_buffer != nullptr;
 
-	int nTargetRefresh = g_nDynamicRefreshRate && steamcompmgr_window_should_limit_fps( global_focus.focusWindow )// && !global_focus.overlayWindow
-		? g_nDynamicRefreshRate
+	int nDynamicRefresh = g_nDynamicRefreshRate[drm_get_screen_type( &g_DRM )];
+
+	int nTargetRefresh = nDynamicRefresh && steamcompmgr_window_should_limit_fps( global_focus.focusWindow )// && !global_focus.overlayWindow
+		? nDynamicRefresh
 		: drm_get_default_refresh( &g_DRM );
 
 	uint64_t now = get_time_in_nanos();
@@ -2005,6 +2007,12 @@ win_skip_taskbar_and_pager( win *w )
 }
 
 static bool
+win_skip_and_not_fullscreen( win *w )
+{
+	return win_skip_taskbar_and_pager( w ) && !w->isFullscreen;
+}
+
+static bool
 win_maybe_a_dropdown( win *w )
 {
 	// Josh:
@@ -2029,7 +2037,7 @@ win_maybe_a_dropdown( win *w )
 	//        ie. a settings menu dialog popup or something.
 	//      - If the window has both skip taskbar and pager, treat it as a dialog.
 	bool valid_maybe_a_dropdown =
-		w->maybe_a_dropdown && ( ( !w->is_dialog || ( !w->transientFor && win_skip_taskbar_and_pager( w ) ) ) && ( w->skipPager || w->skipTaskbar ) );
+		w->maybe_a_dropdown && ( ( !w->is_dialog || ( !w->transientFor && win_skip_and_not_fullscreen( w ) ) ) && ( w->skipPager || w->skipTaskbar ) );
 	return ( valid_maybe_a_dropdown || win_is_override_redirect( w ) ) && !win_is_useless( w );
 }
 
@@ -2066,8 +2074,8 @@ is_focus_priority_greater( win *a, win *b )
 
 	// Wine sets SKIP_TASKBAR and SKIP_PAGER hints for WS_EX_NOACTIVATE windows.
 	// See https://github.com/Plagman/gamescope/issues/87
-	if ( win_skip_taskbar_and_pager( a ) != win_skip_taskbar_and_pager( b ) )
-		return !win_skip_taskbar_and_pager( a );
+	if ( win_skip_and_not_fullscreen( a ) != win_skip_and_not_fullscreen( b ) )
+		return !win_skip_and_not_fullscreen( a );
 
 	// Prefer normal windows over dialogs
 	// if we are an override redirect/dropdown window.
@@ -2290,6 +2298,7 @@ determine_and_apply_focus(xwayland_ctx_t *ctx, std::vector<win*>& vecGlobalPossi
 	ctx->focus.overlayWindow = nullptr;
 	ctx->focus.notificationWindow = nullptr;
 	ctx->focus.overrideWindow = nullptr;
+	ctx->focus.externalOverlayWindow = nullptr;
 
 	unsigned int maxOpacity = 0;
 	unsigned int maxOpacityExternal = 0;
@@ -2324,7 +2333,7 @@ determine_and_apply_focus(xwayland_ctx_t *ctx, std::vector<win*>& vecGlobalPossi
 
 		if (w->isExternalOverlay)
 		{
-			if (w->opacity >= maxOpacityExternal)
+			if (w->opacity > maxOpacityExternal)
 			{
 				ctx->focus.externalOverlayWindow = w;
 				maxOpacityExternal = w->opacity;
@@ -2534,7 +2543,7 @@ determine_and_apply_focus()
 		// Exclude windows that are useless (1x1), skip taskbar + pager or override redirect windows
 		// from the reported focusable windows to Steam.
 		if ( win_is_useless( focusable_window ) ||
-			win_skip_taskbar_and_pager( focusable_window ) ||
+			win_skip_and_not_fullscreen( focusable_window ) ||
 			focusable_window->a.override_redirect )
 			continue;
 
@@ -3220,7 +3229,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
 
 	new_win->mouseMoved = 0;
 
-	wlserver_surface_init( &new_win->surface, id );
+	wlserver_surface_init( &new_win->surface, ctx->xwayland_server, id );
 
 	new_win->next = *p;
 	*p = new_win;
@@ -3448,7 +3457,7 @@ damage_win(xwayland_ctx_t *ctx, XDamageNotifyEvent *de)
 }
 
 static void
-handle_wl_surface_id(xwayland_ctx_t *ctx, win *w, long surfaceID)
+handle_wl_surface_id(xwayland_ctx_t *ctx, win *w, uint32_t surfaceID)
 {
 	struct wlr_surface *surface = NULL;
 
@@ -3582,7 +3591,7 @@ handle_client_message(xwayland_ctx_t *ctx, XClientMessageEvent *ev)
 	{
 		if (ev->message_type == ctx->atoms.WLSurfaceIDAtom)
 		{
-			handle_wl_surface_id( ctx, w, ev->data.l[0]);
+			handle_wl_surface_id( ctx, w, uint32_t(ev->data.l[0]));
 		}
 		else if ( ev->message_type == ctx->atoms.activeWindowAtom )
 		{
@@ -3967,6 +3976,25 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		if ( drm_set_color_gain_blend( &g_DRM, flBlend ) )
 			hasRepaint = true;
 	}
+	if ( ev->atom == ctx->atoms.gamescopeColorGammaExponent )
+	{
+		std::vector< uint32_t > user_vec;
+		bool bHasVec = get_prop( ctx, ctx->root, ctx->atoms.gamescopeColorGammaExponent, user_vec );
+		
+		// identity
+		float vec[6] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+		if ( bHasVec && user_vec.size() == 6 )
+		{
+			for (int i = 0; i < 6; i++)
+				vec[i] = bit_cast<float>( user_vec[i] );
+		}
+
+		if ( drm_set_degamma_exponent( &g_DRM, &vec[0] ) )
+			hasRepaint = true;
+
+		if ( drm_set_gamma_exponent( &g_DRM, &vec[3] ) )
+			hasRepaint = true;
+	}
 	if ( ev->atom == ctx->atoms.gamescopeXWaylandModeControl )
 	{
 		std::vector< uint32_t > xwayland_mode_ctl;
@@ -4008,9 +4036,12 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		g_nSteamCompMgrTargetFPS = get_prop( ctx, ctx->root, ctx->atoms.gamescopeFPSLimit, 0 );
 		update_runtime_info();
 	}
-	if ( ev->atom == ctx->atoms.gamescopeDynamicRefresh )
+	for (int i = 0; i < DRM_SCREEN_TYPE_COUNT; i++)
 	{
-		g_nDynamicRefreshRate = get_prop( ctx, ctx->root, ctx->atoms.gamescopeDynamicRefresh, 0 );
+		if ( ev->atom == ctx->atoms.gamescopeDynamicRefresh[i] )
+		{
+			g_nDynamicRefreshRate[i] = get_prop( ctx, ctx->root, ctx->atoms.gamescopeDynamicRefresh[i], 0 );
+		}
 	}
 	if ( ev->atom == ctx->atoms.gamescopeLowLatency )
 	{
@@ -4451,6 +4482,9 @@ spawn_client( char **argv )
 		// Try to snap back to old priority
 		if ( g_bNiceCap == true )
 		{
+			if ( g_bRt ==  true ){
+				sched_setscheduler(0, g_nOldPolicy, &g_schedOldParam);
+			}
 			nice( g_nOldNice - g_nNewNice );
 		}
 
@@ -4910,9 +4944,13 @@ void init_xwayland_ctx(gamescope_xwayland_server_t *xwayland_server)
 	ctx->atoms.gamescopeColorGain = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_GAIN", false );
 	ctx->atoms.gamescopeColorMatrix = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_MATRIX", false );
 	ctx->atoms.gamescopeColorLinearGainBlend = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_LINEARGAIN_BLEND", false );
+
+	ctx->atoms.gamescopeColorGammaExponent = XInternAtom( ctx->dpy, "GAMESCOPE_COLOR_GAMMA_EXPONENT", false );
+
 	ctx->atoms.gamescopeXWaylandModeControl = XInternAtom( ctx->dpy, "GAMESCOPE_XWAYLAND_MODE_CONTROL", false );
 	ctx->atoms.gamescopeFPSLimit = XInternAtom( ctx->dpy, "GAMESCOPE_FPS_LIMIT", false );
-	ctx->atoms.gamescopeDynamicRefresh = XInternAtom( ctx->dpy, "GAMESCOPE_DYNAMIC_REFRESH", false );
+	ctx->atoms.gamescopeDynamicRefresh[DRM_SCREEN_TYPE_INTERNAL] = XInternAtom( ctx->dpy, "GAMESCOPE_DYNAMIC_REFRESH", false );
+	ctx->atoms.gamescopeDynamicRefresh[DRM_SCREEN_TYPE_EXTERNAL] = XInternAtom( ctx->dpy, "GAMESCOPE_DYNAMIC_REFRESH_EXTERNAL", false );
 	ctx->atoms.gamescopeLowLatency = XInternAtom( ctx->dpy, "GAMESCOPE_LOW_LATENCY", false );
 
 	ctx->atoms.gamescopeFSRFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_FSR_FEEDBACK", false );

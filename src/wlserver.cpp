@@ -98,6 +98,13 @@ void gamescope_xwayland_server_t::wayland_commit(struct wlr_surface *surf, struc
 void xwayland_surface_role_commit(struct wlr_surface *wlr_surface) {
 	assert(wlr_surface->role == &xwayland_surface_role);
 
+	uint32_t committed = wlr_surface->current.committed;
+	wlr_surface->current.committed = 0;
+
+	if (!(committed & WLR_SURFACE_STATE_BUFFER)) {
+		return;
+	}
+
 	VulkanWlrTexture_t *tex = (VulkanWlrTexture_t *) wlr_surface_get_texture( wlr_surface );
 	if ( tex == NULL )
 	{
@@ -115,10 +122,6 @@ void xwayland_surface_role_commit(struct wlr_surface *wlr_surface) {
 
 static void xwayland_surface_role_precommit(struct wlr_surface *wlr_surface) {
 	assert(wlr_surface->role == &xwayland_surface_role);
-	struct wlr_xwayland_surface *surface = (struct wlr_xwayland_surface *) wlr_surface->role_data;
-	if (surface == NULL) {
-		return;
-	}
 }
 
 const struct wlr_surface_role xwayland_surface_role = {
@@ -280,57 +283,7 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 	struct wlserver_touch *touch = wl_container_of( listener, touch, down );
 	struct wlr_event_touch_down *event = (struct wlr_event_touch_down *) data;
 
-	if ( wlserver.mouse_focus_surface != NULL )
-	{
-		double x = g_bRotated ? event->y : event->x;
-		double y = g_bRotated ? 1.0 - event->x : event->y;
-
-		x *= g_nOutputWidth;
-		y *= g_nOutputHeight;
-
-		x += focusedWindowOffsetX;
-		y += focusedWindowOffsetY;
-
-		x *= focusedWindowScaleX;
-		y *= focusedWindowScaleY;
-
-		wlserver.mouse_surface_cursorx = x;
-		wlserver.mouse_surface_cursory = y;
-
-		if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_PASSTHROUGH )
-		{
-			if ( event->touch_id >= 0 && event->touch_id < WLSERVER_TOUCH_COUNT )
-			{
-				wlr_seat_touch_notify_down( wlserver.wlr.seat, wlserver.mouse_focus_surface, event->time_msec, event->touch_id,
-											wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
-
-				wlserver.touch_down[ event->touch_id ] = true;
-			}
-		}
-		else if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_DISABLED )
-		{
-			return;
-		}
-		else
-		{
-			g_bPendingTouchMovement = true;
-
-			wlr_seat_pointer_notify_motion( wlserver.wlr.seat, event->time_msec, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
-			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
-
-			uint32_t button = steamcompmgr_button_to_wlserver_button( g_nTouchClickMode );
-
-			if ( button != 0 && g_nTouchClickMode < WLSERVER_BUTTON_COUNT )
-			{
-				wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, button, WLR_BUTTON_PRESSED );
-				wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
-
-				wlserver.button_held[ g_nTouchClickMode ] = true;
-			}
-		}
-	}
-
-	bump_input_counter();
+	wlserver_touchdown( event->x, event->y, event->touch_id, event->time_msec );
 }
 
 static void wlserver_handle_touch_up(struct wl_listener *listener, void *data)
@@ -338,38 +291,7 @@ static void wlserver_handle_touch_up(struct wl_listener *listener, void *data)
 	struct wlserver_touch *touch = wl_container_of( listener, touch, up );
 	struct wlr_event_touch_up *event = (struct wlr_event_touch_up *) data;
 
-	if ( wlserver.mouse_focus_surface != NULL )
-	{
-		bool bReleasedAny = false;
-		for ( int i = 0; i < WLSERVER_BUTTON_COUNT; i++ )
-		{
-			if ( wlserver.button_held[ i ] == true )
-			{
-				uint32_t button = steamcompmgr_button_to_wlserver_button( i );
-
-				if ( button != 0 )
-				{
-					wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, button, WLR_BUTTON_RELEASED );
-					bReleasedAny = true;
-				}
-
-				wlserver.button_held[ i ] = false;
-			}
-		}
-
-		if ( bReleasedAny == true )
-		{
-			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
-		}
-
-		if ( event->touch_id >= 0 && event->touch_id < WLSERVER_TOUCH_COUNT && wlserver.touch_down[ event->touch_id ] == true )
-		{
-			wlr_seat_touch_notify_up( wlserver.wlr.seat, event->time_msec, event->touch_id );
-			wlserver.touch_down[ event->touch_id ] = false;
-		}
-	}
-
-	bump_input_counter();
+	wlserver_touchup( event->touch_id, event->time_msec );
 }
 
 static void wlserver_handle_touch_motion(struct wl_listener *listener, void *data)
@@ -377,41 +299,7 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 	struct wlserver_touch *touch = wl_container_of( listener, touch, motion );
 	struct wlr_event_touch_motion *event = (struct wlr_event_touch_motion *) data;
 
-	if ( wlserver.mouse_focus_surface != NULL )
-	{
-		double x = g_bRotated ? event->y : event->x;
-		double y = g_bRotated ? 1.0 - event->x : event->y;
-
-		x *= g_nOutputWidth;
-		y *= g_nOutputHeight;
-
-		x += focusedWindowOffsetX;
-		y += focusedWindowOffsetY;
-
-		x *= focusedWindowScaleX;
-		y *= focusedWindowScaleY;
-
-		wlserver.mouse_surface_cursorx = x;
-		wlserver.mouse_surface_cursory = y;
-
-		if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_PASSTHROUGH )
-		{
-			wlr_seat_touch_notify_motion( wlserver.wlr.seat, event->time_msec, event->touch_id, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
-		}
-		else if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_DISABLED )
-		{
-			return;
-		}
-		else
-		{
-			g_bPendingTouchMovement = true;
-
-			wlr_seat_pointer_notify_motion( wlserver.wlr.seat, event->time_msec, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
-			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
-		}
-	}
-
-	bump_input_counter();
+	wlserver_touchmotion( event->x, event->y, event->touch_id, event->time_msec );
 }
 
 static void wlserver_new_input(struct wl_listener *listener, void *data)
@@ -495,7 +383,7 @@ static void wlserver_new_surface(struct wl_listener *l, void *data)
 	struct wlserver_surface *s, *tmp;
 	wl_list_for_each_safe(s, tmp, &pending_surfaces, pending_link)
 	{
-		if (s->wl_id == (long)id && s->wlr == nullptr)
+		if (s->wl_id == id && s->wlr == nullptr)
 		{
 			wlserver_surface_set_wlr( s, wlr_surf );
 		}
@@ -639,10 +527,33 @@ static void handle_wlr_log(enum wlr_log_importance importance, const char *fmt, 
 	wl_log.vlogf(prio, fmt, args);
 }
 
+void wlserver_set_output_info( const wlserver_output_info *info )
+{
+	wlr_output_destroy_global(wlserver.wlr.output);
+
+	wlr_output_set_name(wlserver.wlr.output, info->name);
+	wlr_output_set_description(wlserver.wlr.output, info->description);
+	wlserver.wlr.output->phys_width = info->phys_width;
+	wlserver.wlr.output->phys_height = info->phys_height;
+
+	wlr_output_create_global(wlserver.wlr.output);
+}
+
 bool wlsession_init( void ) {
 	wlr_log_init(WLR_DEBUG, handle_wlr_log);
 
 	wlserver.display = wl_display_create();
+	wlserver.wlr.headless_backend = wlr_headless_backend_create( wlserver.display );
+
+	wlserver.wlr.output = wlr_headless_add_output( wlserver.wlr.headless_backend, 1280, 720 );
+	strncpy(wlserver.wlr.output->make, "gamescope", sizeof(wlserver.wlr.output->make));
+	strncpy(wlserver.wlr.output->model, "gamescope", sizeof(wlserver.wlr.output->model));
+
+	const struct wlserver_output_info output_info = {
+		.name = "Virtual-1",
+		.description = "Virtual gamescope output",
+	};
+	wlserver_set_output_info( &output_info );
 
 	if ( BIsNested() )
 		return true;
@@ -730,15 +641,11 @@ bool wlserver_init( void ) {
 	wlserver.event_loop = wl_display_get_event_loop(wlserver.display);
 
 	wlserver.wlr.multi_backend = wlr_multi_backend_create(wlserver.display);
+	wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.headless_backend );
 
 	assert( wlserver.event_loop && wlserver.wlr.multi_backend );
 
 	wl_signal_add( &wlserver.wlr.multi_backend->events.new_input, &new_input_listener );
-
-	wlserver.wlr.headless_backend = wlr_headless_backend_create( wlserver.display );
-	wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.headless_backend );
-
-	wlserver.wlr.output = wlr_headless_add_output( wlserver.wlr.headless_backend, 1280, 720 );
 
 	if ( bIsDRM == True )
 	{
@@ -821,8 +728,6 @@ bool wlserver_init( void ) {
 		wl_log.errorf("Failed to commit noop output");
 		return false;
 	}
-
-	wlr_output_create_global( wlserver.wlr.output );
 
 	for (int i = 0; i < g_nXWaylandCount; i++)
 	{
@@ -972,6 +877,136 @@ void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *
 	wlr_surface_send_frame_done( surf, when );
 }
 
+void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time )
+{
+	if ( wlserver.mouse_focus_surface != NULL )
+	{
+		double tx = g_bRotated ? y : x;
+		double ty = g_bRotated ? 1.0 - x : y;
+
+		tx *= g_nOutputWidth;
+		ty *= g_nOutputHeight;
+
+		tx += focusedWindowOffsetX;
+		ty += focusedWindowOffsetY;
+
+		tx *= focusedWindowScaleX;
+		ty *= focusedWindowScaleY;
+
+		wlserver.mouse_surface_cursorx = tx;
+		wlserver.mouse_surface_cursory = ty;
+
+		if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_PASSTHROUGH )
+		{
+			wlr_seat_touch_notify_motion( wlserver.wlr.seat, time, touch_id, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
+		}
+		else if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_DISABLED )
+		{
+			return;
+		}
+		else
+		{
+			g_bPendingTouchMovement = true;
+
+			wlr_seat_pointer_notify_motion( wlserver.wlr.seat, time, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
+			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+		}
+	}
+
+	bump_input_counter();
+}
+
+void wlserver_touchdown( double x, double y, int touch_id, uint32_t time )
+{
+	if ( wlserver.mouse_focus_surface != NULL )
+	{
+		double tx = g_bRotated ? y : x;
+		double ty = g_bRotated ? 1.0 - x : y;
+
+		tx *= g_nOutputWidth;
+		ty *= g_nOutputHeight;
+
+		tx += focusedWindowOffsetX;
+		ty += focusedWindowOffsetY;
+
+		tx *= focusedWindowScaleX;
+		ty *= focusedWindowScaleY;
+
+		wlserver.mouse_surface_cursorx = tx;
+		wlserver.mouse_surface_cursory = ty;
+
+		if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_PASSTHROUGH )
+		{
+			if ( touch_id >= 0 && touch_id < WLSERVER_TOUCH_COUNT )
+			{
+				wlr_seat_touch_notify_down( wlserver.wlr.seat, wlserver.mouse_focus_surface, time, touch_id,
+											wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
+
+				wlserver.touch_down[ touch_id ] = true;
+			}
+		}
+		else if ( g_nTouchClickMode == WLSERVER_TOUCH_CLICK_DISABLED )
+		{
+			return;
+		}
+		else
+		{
+			g_bPendingTouchMovement = true;
+
+			wlr_seat_pointer_notify_motion( wlserver.wlr.seat, time, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
+			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+
+			uint32_t button = steamcompmgr_button_to_wlserver_button( g_nTouchClickMode );
+
+			if ( button != 0 && g_nTouchClickMode < WLSERVER_BUTTON_COUNT )
+			{
+				wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, WLR_BUTTON_PRESSED );
+				wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+
+				wlserver.button_held[ g_nTouchClickMode ] = true;
+			}
+		}
+	}
+
+	bump_input_counter();
+}
+
+void wlserver_touchup( int touch_id, uint32_t time )
+{
+	if ( wlserver.mouse_focus_surface != NULL )
+	{
+		bool bReleasedAny = false;
+		for ( int i = 0; i < WLSERVER_BUTTON_COUNT; i++ )
+		{
+			if ( wlserver.button_held[ i ] == true )
+			{
+				uint32_t button = steamcompmgr_button_to_wlserver_button( i );
+
+				if ( button != 0 )
+				{
+					wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, WLR_BUTTON_RELEASED );
+					bReleasedAny = true;
+				}
+
+				wlserver.button_held[ i ] = false;
+			}
+		}
+
+		if ( bReleasedAny == true )
+		{
+			wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+		}
+
+		if ( touch_id >= 0 && touch_id < WLSERVER_TOUCH_COUNT && wlserver.touch_down[ touch_id ] == true )
+		{
+			wlr_seat_touch_notify_up( wlserver.wlr.seat, time, touch_id );
+			wlserver.touch_down[ touch_id ] = false;
+		}
+	}
+
+	bump_input_counter();
+}
+
 gamescope_xwayland_server_t *wlserver_get_xwayland_server( size_t index )
 {
 	if (index >= wlserver.wlr.xwayland_servers.size() )
@@ -988,7 +1023,7 @@ static void handle_surface_destroy( struct wl_listener *l, void *data )
 {
 	struct wlserver_surface *surf = wl_container_of( l, surf, destroy );
 	wlserver_surface_finish( surf );
-	wlserver_surface_init( surf, surf->x11_id );
+	wlserver_surface_init( surf, surf->xwayland_server, surf->x11_id );
 }
 
 static void wlserver_surface_set_wlr( struct wlserver_surface *surf, struct wlr_surface *wlr_surf )
@@ -1002,6 +1037,7 @@ static void wlserver_surface_set_wlr( struct wlserver_surface *surf, struct wlr_
 	wl_signal_add( &wlr_surf->events.destroy, &surf->destroy );
 
 	surf->wlr = wlr_surf;
+	wlr_surf->data = surf->xwayland_server;
 
 	if ( !wlr_surface_set_role(wlr_surf, &xwayland_surface_role, NULL, NULL, 0 ) )
 	{
@@ -1009,25 +1045,27 @@ static void wlserver_surface_set_wlr( struct wlserver_surface *surf, struct wlr_
 	}
 }
 
-void wlserver_surface_init( struct wlserver_surface *surf, long x11_id )
+void wlserver_surface_init( struct wlserver_surface *surf, gamescope_xwayland_server_t *server, uint32_t x11_id )
 {
 	surf->wl_id = 0;
 	surf->x11_id = x11_id;
 	surf->wlr = nullptr;
+	surf->xwayland_server = server;
 	wl_list_init( &surf->pending_link );
 	wl_list_init( &surf->destroy.link );
 }
 
-void gamescope_xwayland_server_t::set_wl_id( struct wlserver_surface *surf, long id )
+void gamescope_xwayland_server_t::set_wl_id( struct wlserver_surface *surf, uint32_t id )
 {
 	if ( surf->wl_id != 0 )
 	{
-		wl_log.errorf( "surf->wl_id already set, was %lu, set %lu", surf->wl_id, id );
+		wl_log.errorf( "surf->wl_id already set, was %u, set %u", surf->wl_id, id );
 		return;
 	}
 
 	surf->wl_id = id;
 	surf->wlr = nullptr;
+	surf->xwayland_server = this;
 
 	wl_list_insert( &pending_surfaces, &surf->pending_link );
 	wl_list_init( &surf->destroy.link );

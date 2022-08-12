@@ -27,6 +27,8 @@
 #include "pipewire.hpp"
 #endif
 
+EStreamColorspace g_ForcedNV12ColorSpace = k_EStreamColorspace_Unknown;
+
 const char *gamescope_optstring = nullptr;
 
 const struct option *gamescope_options = (struct option[]){
@@ -43,6 +45,8 @@ const struct option *gamescope_options = (struct option[]){
 	{ "nis-upscaling", no_argument, nullptr, 'Y' },
 	{ "sharpness", required_argument, nullptr, 0 },
 	{ "fsr-sharpness", required_argument, nullptr, 0 },
+	{ "rt", no_argument, nullptr, 0 },
+	{ "prefer-vk-device", required_argument, 0 },
 
 	// nested mode options
 	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
@@ -96,10 +100,12 @@ const char usage[] =
 	"  --sharpness --fsr-sharpness    upscaler sharpness from 0 (max) to 20 (min)\n"
 	"  --cursor                       path to default cursor image\n"
 	"  -R, --ready-fd                 notify FD when ready\n"
+	"  --rt                           Use realtime scheduling\n"
 	"  -T, --stats-path               write statistics to path\n"
 	"  -C, --hide-cursor-delay        hide cursor image after delay\n"
 	"  -e, --steam                    enable Steam integration\n"
 	" --xwayland-count                create N xwayland servers\n"
+	" --prefer-vk-device              prefer Vulkan device for compositing (ex: 1002:7300)\n"
 	"\n"
 	"Nested mode options:\n"
 	"  -o, --nested-unfocused-refresh game refresh rate when unfocused\n"
@@ -159,8 +165,15 @@ bool g_bNiceCap = false;
 int g_nOldNice = 0;
 int g_nNewNice = 0;
 
+bool g_bRt = false;
+int g_nOldPolicy;
+struct sched_param g_schedOldParam;
+
 float g_flMaxWindowScale = FLT_MAX;
 bool g_bIntegerScale = false;
+
+uint32_t g_preferVendorID = 0;
+uint32_t g_preferDeviceID = 0;
 
 pthread_t g_mainThread;
 
@@ -263,6 +276,23 @@ static void raise_fd_limit( void )
 	g_fdLimitRaised = true;
 }
 
+static EStreamColorspace parse_colorspace_string( const char *pszStr )
+{
+	if ( !pszStr || !*pszStr )
+		return k_EStreamColorspace_Unknown;
+
+	if ( !strcmp( pszStr, "k_EStreamColorspace_BT601" ) )
+		return k_EStreamColorspace_BT601;
+	else if ( !strcmp( pszStr, "k_EStreamColorspace_BT601_Full" ) )
+		return k_EStreamColorspace_BT601_Full;
+	else if ( !strcmp( pszStr, "k_EStreamColorspace_BT709" ) )
+		return k_EStreamColorspace_BT709;
+	else if ( !strcmp( pszStr, "k_EStreamColorspace_BT709_Full" ) )
+		return k_EStreamColorspace_BT709_Full;
+	else
+	 	return k_EStreamColorspace_Unknown;
+}
+
 int g_nPreferredOutputWidth = 0;
 int g_nPreferredOutputHeight = 0;
 
@@ -342,6 +372,14 @@ int main(int argc, char **argv)
 				} else if (strcmp(opt_name, "sharpness") == 0 ||
 						   strcmp(opt_name, "fsr-sharpness") == 0) {
 					g_upscalerSharpness = atoi( optarg );
+				} else if (strcmp(opt_name, "rt") == 0) {
+					g_bRt = true;
+				} else if (strcmp(opt_name, "prefer-vk-device") == 0) {
+					unsigned vendorID;
+					unsigned deviceID;
+					sscanf( optarg, "%X:%X", &vendorID, &deviceID );
+					g_preferVendorID = vendorID;
+					g_preferDeviceID = deviceID;
 				}
 				break;
 			case '?':
@@ -372,6 +410,19 @@ int main(int argc, char **argv)
 			if ( nNewNice != -1 && errno == 0 )
 			{
 				g_nNewNice = nNewNice;
+			}
+			if ( g_bRt )
+			{
+				struct sched_param sched;
+				sched_getparam(0, &sched);
+				sched.sched_priority = sched_get_priority_min(SCHED_RR);
+
+				if (pthread_getschedparam(pthread_self(), &g_nOldPolicy, &g_schedOldParam)) {
+					fprintf(stderr, "Failed to get old scheduling parameters: %s", strerror(errno));
+					exit(1);
+				}
+				if (sched_setscheduler(0, SCHED_RR, &sched))
+					fprintf(stderr, "Failed to set realtime: %s", strerror(errno));
 			}
 		}
 	}
@@ -413,6 +464,8 @@ int main(int argc, char **argv)
 		}
 	}
 
+	g_ForcedNV12ColorSpace = parse_colorspace_string( getenv( "GAMESCOPE_NV12_COLORSPACE" ) );
+
 	if ( !vulkan_init() )
 	{
 		fprintf( stderr, "Failed to initialize Vulkan\n" );
@@ -442,7 +495,7 @@ int main(int argc, char **argv)
 
 	// If DRM format modifiers aren't supported, prevent our clients from using
 	// DCC, as this can cause tiling artifacts.
-	if ( !g_vulkanSupportsModifiers )
+	if ( !vulkan_supports_modifiers() )
 	{
 		const char *pchR600Debug = getenv( "R600_DEBUG" );
 

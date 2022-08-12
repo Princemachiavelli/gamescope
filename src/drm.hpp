@@ -6,6 +6,23 @@
 #include <xf86drmMode.h>
 #include <assert.h>
 #include <drm_fourcc.h>
+
+// Josh: Okay whatever, this header isn't
+// available for whatever stupid reason. :v
+//#include <drm_color_mgmt.h>
+enum drm_color_encoding {
+	DRM_COLOR_YCBCR_BT601,
+	DRM_COLOR_YCBCR_BT709,
+	DRM_COLOR_YCBCR_BT2020,
+	DRM_COLOR_ENCODING_MAX,
+};
+
+enum drm_color_range {
+	DRM_COLOR_YCBCR_LIMITED_RANGE,
+	DRM_COLOR_YCBCR_FULL_RANGE,
+	DRM_COLOR_RANGE_MAX,
+};
+
 #include <wayland-server-core.h>
 
 extern "C" {
@@ -20,6 +37,7 @@ extern "C" {
 #include <utility>
 #include <atomic>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <vector>
 
@@ -36,6 +54,7 @@ struct crtc {
 	std::map<std::string, const drmModePropertyRes *> props;
 	std::map<std::string, uint64_t> initial_prop_values;
 	bool has_gamma_lut;
+	bool has_degamma_lut;
 	bool has_ctm;
 
 	struct {
@@ -50,6 +69,10 @@ struct connector {
 	uint32_t possible_crtcs;
 	std::map<std::string, const drmModePropertyRes *> props;
 	std::map<std::string, uint64_t> initial_prop_values;
+
+	char make_pnp[4];
+	char *make;
+	char *model;
 };
 
 struct fb {
@@ -75,7 +98,7 @@ struct drm_t {
 
 	std::vector< struct plane > planes;
 	std::vector< struct crtc > crtcs;
-	std::map< uint32_t, struct connector > connectors;
+	std::unordered_map< uint32_t, struct connector > connectors;
 
 	std::map< uint32_t, drmModePropertyRes * > props;
 	
@@ -98,9 +121,12 @@ struct drm_t {
 	struct {
 		uint32_t mode_id;
 		uint32_t gamma_lut_id;
+		uint32_t degamma_lut_id;
 		uint32_t ctm_id;
 		float color_gain[3] = { 1.0f, 1.0f, 1.0f };
 		float color_linear_gain[3] = { 1.0f, 1.0f, 1.0f };
+		float color_gamma_exponent[3] = { 1.0f, 1.0f, 1.0f };
+		float color_degamma_exponent[3] = { 1.0f, 1.0f, 1.0f };
 		float color_mtx[9] =
 		{
 			1.0f, 0.0f, 0.0f,
@@ -141,12 +167,20 @@ extern uint32_t g_nDRMFormat;
 
 extern bool g_bUseLayers;
 extern bool g_bRotated;
+extern bool g_bFlipped;
 extern bool g_bDebugLayers;
 extern const char *g_sOutputName;
 
 enum drm_mode_generation {
 	DRM_MODE_GENERATE_CVT,
 	DRM_MODE_GENERATE_FIXED,
+};
+
+enum drm_screen_type {
+	DRM_SCREEN_TYPE_INTERNAL = 0,
+	DRM_SCREEN_TYPE_EXTERNAL = 1,
+
+	DRM_SCREEN_TYPE_COUNT
 };
 
 extern enum drm_mode_generation g_drmModeGeneration;
@@ -170,7 +204,11 @@ bool drm_set_color_gains(struct drm_t *drm, float *gains);
 bool drm_set_color_mtx(struct drm_t *drm, float *mtx);
 bool drm_set_color_gain_blend(struct drm_t *drm, float blend);
 bool drm_update_gamma_lut(struct drm_t *drm);
+bool drm_update_degamma_lut(struct drm_t *drm);
 bool drm_update_color_mtx(struct drm_t *drm);
+bool drm_set_gamma_exponent(struct drm_t *drm, float *vec);
+bool drm_set_degamma_exponent(struct drm_t *drm, float *vec);
+drm_screen_type drm_get_screen_type(struct drm_t *drm);
 
 char *find_drm_node_by_devid(dev_t devid);
 int drm_get_default_refresh(struct drm_t *drm);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "drm.hpp"
+
 #include <mutex>
 #include <memory>
 #include <vector>
@@ -124,10 +126,12 @@ struct xwayland_ctx_t
 		Atom gamescopeColorMatrix;
 		Atom gamescopeColorLinearGainBlend;
 
+		Atom gamescopeColorGammaExponent;
+
 		Atom gamescopeXWaylandModeControl;
 
 		Atom gamescopeFPSLimit;
-		Atom gamescopeDynamicRefresh;
+		Atom gamescopeDynamicRefresh[DRM_SCREEN_TYPE_COUNT];
 		Atom gamescopeLowLatency;
 
 		Atom gamescopeFSRFeedback;

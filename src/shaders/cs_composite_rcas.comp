@@ -1,6 +1,5 @@
 #version 460
 
-#extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 
 #include "descriptor_set.h"
@@ -10,12 +9,12 @@ layout(
   local_size_y = 1,
   local_size_z = 1) in;
 
-layout(std430, push_constant)
+layout(push_constant)
 uniform layers_t {
     uvec2 u_layer0Offset;
-    vec2 u_scale[MaxLayers - 1];
-    vec2 u_offset[MaxLayers - 1];
-    float u_opacity[MaxLayers];
+    vec2 u_scale[VKR_MAX_LAYERS - 1];
+    vec2 u_offset[VKR_MAX_LAYERS - 1];
+    float u_opacity[VKR_MAX_LAYERS];
     uint u_borderMask;
     uint u_frameId;
     uint u_c1;
@@ -42,6 +41,9 @@ vec4 sampleLayer(uint layerIdx, vec2 uv) {
 void rcasComposite(uvec2 pos)
 {
     vec3 outputValue = vec3(0.0f);
+
+    if (c_compositing_debug)
+        outputValue = vec3(1.0f, 0.0f, 0.0f);
 
     if (c_layerCount > 0) {
         // this is actually signed, underflow will be filtered out by the branch below

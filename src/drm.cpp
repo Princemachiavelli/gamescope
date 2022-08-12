@@ -45,6 +45,8 @@ enum drm_mode_generation g_drmModeGeneration = DRM_MODE_GENERATE_CVT;
 static LogScope drm_log("drm");
 static LogScope drm_verbose_log("drm", LOG_SILENT);
 
+static std::map< std::string, std::string > pnps = {};
+
 static std::map< uint32_t, const char * > connector_types = {
 	{ DRM_MODE_CONNECTOR_Unknown, "Unknown" },
 	{ DRM_MODE_CONNECTOR_VGA, "VGA" },
@@ -312,10 +314,15 @@ static bool get_object_properties(struct drm_t *drm, uint32_t obj_id, uint32_t o
 
 static bool compare_modes( drmModeModeInfo mode1, drmModeModeInfo mode2 )
 {
-	if (mode1.type & DRM_MODE_TYPE_PREFERRED)
-		return true;
-	if (mode2.type & DRM_MODE_TYPE_PREFERRED)
-		return false;
+	bool goodRefresh1 = mode1.vrefresh >= 60;
+	bool goodRefresh2 = mode2.vrefresh >= 60;
+	if (goodRefresh1 != goodRefresh2)
+		return goodRefresh1;
+
+	bool preferred1 = mode1.type & DRM_MODE_TYPE_PREFERRED;
+	bool preferred2 = mode2.type & DRM_MODE_TYPE_PREFERRED;
+	if (preferred1 != preferred2)
+		return preferred1;
 
 	int area1 = mode1.hdisplay * mode1.vdisplay;
 	int area2 = mode2.hdisplay * mode2.vdisplay;
@@ -323,6 +330,66 @@ static bool compare_modes( drmModeModeInfo mode1, drmModeModeInfo mode2 )
 		return area1 > area2;
 
 	return mode1.vrefresh > mode2.vrefresh;
+}
+
+static void parse_edid( drm_t *drm, struct connector *conn)
+{
+	memset(conn->make_pnp, 0, sizeof(conn->make_pnp));
+	free(conn->make);
+	conn->make = NULL;
+	free(conn->model);
+	conn->model = NULL;
+
+	if (conn->props.count("EDID") == 0) {
+		return;
+	}
+
+	uint64_t blob_id = conn->initial_prop_values["EDID"];
+	if (blob_id == 0) {
+		return;
+	}
+
+	drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(drm->fd, blob_id);
+	if (!blob) {
+		drm_log.errorf_errno("drmModeGetPropertyBlob(EDID) failed");
+		return;
+	}
+
+	if (blob->length < 128) {
+		drm_log.errorf("Truncated EDID");
+		return;
+	}
+
+	const uint8_t *data = (const uint8_t *) blob->data;
+
+	// The ASCII 3-letter manufacturer PnP ID is encoded in 5-bit codes
+	uint16_t id = (data[8] << 8) | data[9];
+	char pnp_id[] = {
+		(char)(((id >> 10) & 0x1F) + '@'),
+		(char)(((id >> 5) & 0x1F) + '@'),
+		(char)(((id >> 0) & 0x1F) + '@'),
+		'\0',
+	};
+	memcpy(conn->make_pnp, pnp_id, sizeof(pnp_id));
+	if (pnps.count(pnp_id) > 0) {
+		conn->make = strdup(pnps[pnp_id].c_str());
+	}
+
+	for (size_t i = 72; i <= 108; i += 18) {
+		uint16_t flag = (data[i] << 8) | data[i + 1];
+		if (flag == 0 && data[i + 3] == 0xFC) {
+			char model[14];
+			snprintf(model, sizeof(model), "%.13s", &data[i + 5]);
+			char *nl = strchr(model, '\n');
+			if (nl) {
+				*nl = '\0';
+			}
+
+			conn->model = strdup(model);
+		}
+	}
+
+	drmModeFreePropertyBlob(blob);
 }
 
 static bool refresh_state( drm_t *drm )
@@ -357,8 +424,10 @@ static bool refresh_state( drm_t *drm )
 		}
 
 		if (!found) {
+			drm_log.debugf("connector '%s' disappeared", conn->name);
+
 			if (drm->connector == conn) {
-				drm_log.infof("current connector '%s' disconnected", conn->name);
+				drm_log.infof("current connector '%s' disappeared", conn->name);
 				drm->connector = nullptr;
 			}
 
@@ -375,10 +444,6 @@ static bool refresh_state( drm_t *drm )
 	// Re-probe connectors props and status
 	for (auto &kv : drm->connectors) {
 		struct connector *conn = &kv.second;
-		if (!get_object_properties(drm, conn->id, DRM_MODE_OBJECT_CONNECTOR, conn->props, conn->initial_prop_values)) {
-			return false;
-		}
-
 		if (conn->connector != nullptr)
 			drmModeFreeConnector(conn->connector);
 
@@ -388,9 +453,15 @@ static bool refresh_state( drm_t *drm )
 			return false;
 		}
 
+		if (!get_object_properties(drm, conn->id, DRM_MODE_OBJECT_CONNECTOR, conn->props, conn->initial_prop_values)) {
+			return false;
+		}
+
 		/* sort modes by preference: preferred flag, then highest area, then
 		 * highest refresh rate */
 		std::stable_sort(conn->connector->modes, conn->connector->modes + conn->connector->count_modes, compare_modes);
+
+		parse_edid(drm, conn);
 
 		if ( conn->name != nullptr )
 			continue;
@@ -401,10 +472,11 @@ static bool refresh_state( drm_t *drm )
 
 		char name[128] = {};
 		snprintf(name, sizeof(name), "%s-%d", type_str, conn->connector->connector_type_id);
-
 		conn->name = strdup(name);
 
 		conn->possible_crtcs = get_connector_possible_crtcs(drm, conn->connector);
+
+		drm_log.debugf("found new connector '%s'", conn->name);
 	}
 
 	for (size_t i = 0; i < drm->crtcs.size(); i++) {
@@ -416,6 +488,9 @@ static bool refresh_state( drm_t *drm )
 		crtc->has_gamma_lut = (crtc->props.find( "GAMMA_LUT" ) != crtc->props.end());
 		if (!crtc->has_gamma_lut)
 			drm_log.infof("CRTC %" PRIu32 " has no gamma LUT support", crtc->id);
+		crtc->has_degamma_lut = (crtc->props.find( "DEGAMMA_LUT" ) != crtc->props.end());
+		if (!crtc->has_degamma_lut)
+			drm_log.infof("CRTC %" PRIu32 " has no degamma LUT support", crtc->id);
 		crtc->has_ctm = (crtc->props.find( "CTM" ) != crtc->props.end());
 		if (!crtc->has_ctm)
 			drm_log.infof("CRTC %" PRIu32 " has no CTM support", crtc->id);
@@ -590,6 +665,31 @@ static bool setup_best_connector(struct drm_t *drm)
 		return false;
 	}
 
+	char description[256];
+	switch (best->connector->connector_type) {
+	case DRM_MODE_CONNECTOR_LVDS:
+	case DRM_MODE_CONNECTOR_eDP:
+		snprintf(description, sizeof(description), "Internal screen");
+		break;
+	default:
+		if (best->make && best->model) {
+			snprintf(description, sizeof(description), "%s %s", best->make, best->model);
+		} else if (best->model) {
+			snprintf(description, sizeof(description), "%s", best->model);
+		} else {
+			snprintf(description, sizeof(description), "External screen");
+		}
+		break;
+	}
+
+	const struct wlserver_output_info wlserver_output_info = {
+		.name = best->name,
+		.description = description,
+		.phys_width = (int) best->connector->mmWidth,
+		.phys_height = (int) best->connector->mmHeight,
+	};
+	wlserver_set_output_info(&wlserver_output_info);
+
 	return true;
 }
 
@@ -635,17 +735,53 @@ char *find_drm_node_by_devid(dev_t devid)
 	return name;
 }
 
+void load_pnps(void)
+{
+	// TODO: use hwdata's pkg-config file once they ship one
+	const char *filename = "/usr/share/hwdata/pnp.ids";
+	FILE *f = fopen(filename, "r");
+	if (!f) {
+		drm_log.infof("failed to open PNP IDs file at '%s'", filename);
+		return;
+	}
+
+	char *line = NULL;
+	size_t line_size = 0;
+	while (getline(&line, &line_size, f) >= 0) {
+		char *nl = strchr(line, '\n');
+		if (nl) {
+			*nl = '\0';
+		}
+
+		char *sep = strchr(line, '\t');
+		if (!sep) {
+			continue;
+		}
+		*sep = '\0';
+
+		std::string id(line);
+		std::string name(sep + 1);
+		pnps[id] = name;
+	}
+
+	free(line);
+	fclose(f);
+}
+
 bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 {
+	load_pnps();
+
 	drm->preferred_width = width;
 	drm->preferred_height = height;
 	drm->preferred_refresh = refresh;
 
 	char *device_name = nullptr;
-	if (g_vulkanHasDrmPrimaryDevId) {
-		device_name = find_drm_node_by_devid(g_vulkanDrmPrimaryDevId);
+	dev_t dev_id = 0;
+	if (vulkan_primary_dev_id(&dev_id)) {
+		device_name = find_drm_node_by_devid(dev_id);
 		if (device_name == nullptr) {
-			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)g_vulkanDrmPrimaryDevId);
+			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)dev_id);
 			return false;
 		}
 		drm_log.infof("opening DRM node '%s'", device_name);
@@ -744,7 +880,7 @@ static int add_property(drmModeAtomicReq *req, uint32_t obj_id, std::map<std::st
 	if ( props.count( name ) == 0 )
 	{
 		drm_log.errorf("no property %s on object %u", name, obj_id);
-		return -EINVAL;
+		return -ENOENT;
 	}
 
 	const drmModePropertyRes *prop = props[ name ];
@@ -788,6 +924,8 @@ void finish_drm(struct drm_t *drm)
 		add_crtc_property(req, &drm->crtcs[i], "MODE_ID", 0);
 		if ( drm->crtcs[i].has_gamma_lut )
 			add_crtc_property(req, &drm->crtcs[i], "GAMMA_LUT", 0);
+		if ( drm->crtcs[i].has_degamma_lut )
+			add_crtc_property(req, &drm->crtcs[i], "DEGAMMA_LUT", 0);
 		if ( drm->crtcs[i].has_ctm )
 			add_crtc_property(req, &drm->crtcs[i], "CTM", 0);
 		add_crtc_property(req, &drm->crtcs[i], "ACTIVE", 0);
@@ -899,6 +1037,8 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 				drmModeDestroyPropertyBlob(drm->fd, drm->current.mode_id);
 			if ( drm->pending.gamma_lut_id != drm->current.gamma_lut_id )
 				drmModeDestroyPropertyBlob(drm->fd, drm->current.gamma_lut_id);
+			if ( drm->pending.degamma_lut_id != drm->current.degamma_lut_id )
+				drmModeDestroyPropertyBlob(drm->fd, drm->current.degamma_lut_id);
 			drm->crtcs[i].current = drm->crtcs[i].pending;
 		}
 	}
@@ -1159,6 +1299,47 @@ drm_prepare_basic( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	return ret;
 }
 
+// Only used for NV12 buffers
+static drm_color_encoding drm_get_color_encoding(EStreamColorspace colorspace)
+{
+	switch (colorspace)
+	{
+		default:
+		case k_EStreamColorspace_Unknown:
+			return DRM_COLOR_YCBCR_BT709;
+
+		case k_EStreamColorspace_BT601:
+			return DRM_COLOR_YCBCR_BT601;
+		case k_EStreamColorspace_BT601_Full:
+			return DRM_COLOR_YCBCR_BT601;
+
+		case k_EStreamColorspace_BT709:
+			return DRM_COLOR_YCBCR_BT709;
+		case k_EStreamColorspace_BT709_Full:
+			return DRM_COLOR_YCBCR_BT709;
+	}
+}
+
+static drm_color_range drm_get_color_range(EStreamColorspace colorspace)
+{
+	switch (colorspace)
+	{
+		default:
+		case k_EStreamColorspace_Unknown:
+			return DRM_COLOR_YCBCR_FULL_RANGE;
+
+		case k_EStreamColorspace_BT601:
+			return DRM_COLOR_YCBCR_LIMITED_RANGE;
+		case k_EStreamColorspace_BT601_Full:
+			return DRM_COLOR_YCBCR_FULL_RANGE;
+
+		case k_EStreamColorspace_BT709:
+			return DRM_COLOR_YCBCR_LIMITED_RANGE;
+		case k_EStreamColorspace_BT709_Full:
+			return DRM_COLOR_YCBCR_FULL_RANGE;
+	}
+}
+
 static int
 drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 {
@@ -1209,10 +1390,24 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "CRTC_W", crtcW);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "CRTC_H", crtcH);
+
+			if ( frameInfo->layers[i].isYcbcr() )
+			{
+				liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_ENCODING", drm_get_color_encoding( g_ForcedNV12ColorSpace ) );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_RANGE", drm_get_color_range( g_ForcedNV12ColorSpace ) );
+			}
+			else
+			{
+				liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_ENCODING" );
+				liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
+			}
 		}
 		else
 		{
 			liftoff_layer_set_property( drm->lo_layers[ i ], "FB_ID", 0 );
+
+			liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_ENCODING" );
+			liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
 		}
 	}
 
@@ -1233,11 +1428,12 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	return ret;
 }
 
-/* Prepares an atomic commit for the provided scene-graph. Returns false on
- * error or if the scene-graph can't be presented directly. */
+/* Prepares an atomic commit for the provided scene-graph. Returns 0 on success,
+ * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 {
 	drm_update_gamma_lut(drm);
+	drm_update_degamma_lut(drm);
 	drm_update_color_mtx(drm);
 
 	drm->fbids_in_req.clear();
@@ -1259,53 +1455,78 @@ int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		for ( auto &kv : drm->connectors ) {
 			struct connector *conn = &kv.second;
-			if ( add_connector_property( drm->req, conn, "CRTC_ID", 0 ) < 0 )
-				return false;
+			int ret = add_connector_property( drm->req, conn, "CRTC_ID", 0 );
+			if (ret < 0)
+				return ret;
 		}
 		for ( size_t i = 0; i < drm->crtcs.size(); i++ ) {
+			struct crtc *crtc = &drm->crtcs[i];
+
 			// We can't disable a CRTC if it's already disabled, or else the
 			// kernel will error out with "requesting event but off".
-			if (drm->crtcs[i].current.active == 0)
+			if (crtc->current.active == 0)
 				continue;
 
-			if (add_crtc_property(drm->req, &drm->crtcs[i], "MODE_ID", 0) < 0)
+			if (add_crtc_property(drm->req, crtc, "MODE_ID", 0) < 0)
 				return false;
-			if (drm->crtcs[i].has_gamma_lut)
+			if (crtc->has_gamma_lut)
 			{
-				if (add_crtc_property(drm->req, &drm->crtcs[i], "GAMMA_LUT", 0) < 0)
-					return false;
+				int ret = add_crtc_property(drm->req, crtc, "GAMMA_LUT", 0);
+				if (ret < 0)
+					return ret;
 			}
-			if (drm->crtcs[i].has_ctm)
+			if (crtc->has_degamma_lut)
 			{
-				if (add_crtc_property(drm->req, &drm->crtcs[i], "CTM", 0) < 0)
-					return false;
+				int ret = add_crtc_property(drm->req, crtc, "DEGAMMA_LUT", 0);
+				if (ret < 0)
+					return ret;
 			}
-			if (add_crtc_property(drm->req, &drm->crtcs[i], "ACTIVE", 0) < 0)
-				return false;
-			drm->crtcs[i].pending.active = 0;
+			if (crtc->has_ctm)
+			{
+				int ret = add_crtc_property(drm->req, crtc, "CTM", 0);
+				if (ret < 0)
+					return ret;
+			}
+
+			int ret = add_crtc_property(drm->req, crtc, "ACTIVE", 0);
+			if (ret < 0)
+				return ret;
+			crtc->pending.active = 0;
 		}
 
 		// Then enable the one we've picked
 
-		if (add_connector_property(drm->req, drm->connector, "CRTC_ID", drm->crtc->id) < 0)
-			return false;
+		int ret = add_connector_property(drm->req, drm->connector, "CRTC_ID", drm->crtc->id);
+		if (ret < 0)
+			return ret;
 
-		if (add_crtc_property(drm->req, drm->crtc, "MODE_ID", drm->pending.mode_id) < 0)
-			return false;
+		ret = add_crtc_property(drm->req, drm->crtc, "MODE_ID", drm->pending.mode_id);
+		if (ret < 0)
+			return ret;
 
 		if (drm->crtc->has_gamma_lut)
 		{
-			if (add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id) < 0)
+			ret = add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id);
+			if (ret < 0)
+				return false;
+		}
+
+		if (drm->crtc->has_degamma_lut)
+		{
+			ret = add_crtc_property(drm->req, drm->crtc, "DEGAMMA_LUT", drm->pending.degamma_lut_id);
+			if (ret < 0)
 				return false;
 		}
 
 		if (drm->crtc->has_ctm)
 		{
-			if (add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id) < 0)
+			ret = add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id);
+			if (ret < 0)
 				return false;
 		}
 
-		if (add_crtc_property(drm->req, drm->crtc, "ACTIVE", 1) < 0)
+		ret = add_crtc_property(drm->req, drm->crtc, "ACTIVE", 1);
+		if (ret < 0)
 			return false;
 		drm->crtc->pending.active = 1;
 	}
@@ -1313,14 +1534,23 @@ int drm_prepare( struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	{
 		if ( drm->crtc->has_gamma_lut && drm->pending.gamma_lut_id != drm->current.gamma_lut_id )
 		{
-			if (add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id) < 0)
-				return false;	
+			int ret = add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id);
+			if (ret < 0)
+				return ret;
+		}
+
+		if ( drm->crtc->has_degamma_lut && drm->pending.degamma_lut_id != drm->current.degamma_lut_id )
+		{
+			int ret = add_crtc_property(drm->req, drm->crtc, "DEGAMMA_LUT", drm->pending.degamma_lut_id);
+			if (ret < 0)
+				return ret;
 		}
 
 		if ( drm->crtc->has_ctm && drm->pending.ctm_id != drm->current.ctm_id )
 		{
-			if (add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id) < 0)
-				return false;
+			int ret = add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id);
+			if (ret < 0)
+				return ret;
 		}
 	}
 
@@ -1487,15 +1717,58 @@ bool drm_set_color_gain_blend(struct drm_t *drm, float blend)
 	return false;
 }
 
+bool drm_set_gamma_exponent(struct drm_t *drm, float *vec)
+{
+	for (int i = 0; i < 3; i++)
+		drm->pending.color_gamma_exponent[i] = vec[i];
+
+	for (int i = 0; i < 3; i++)
+	{
+		if ( drm->current.color_gamma_exponent[i] != drm->pending.color_gamma_exponent[i] )
+			return true;
+	}
+	return false;
+}
+
+bool drm_set_degamma_exponent(struct drm_t *drm, float *vec)
+{
+	for (int i = 0; i < 3; i++)
+		drm->pending.color_degamma_exponent[i] = vec[i];
+
+	for (int i = 0; i < 3; i++)
+	{
+		if ( drm->current.color_degamma_exponent[i] != drm->pending.color_degamma_exponent[i] )
+			return true;
+	}
+	return false;
+}
+
+drm_screen_type drm_get_screen_type(struct drm_t *drm)
+{
+	if (!drm->connector || !drm->connector->connector)
+		return DRM_SCREEN_TYPE_INTERNAL;
+
+	if ( drm->connector->connector->connector_type == DRM_MODE_CONNECTOR_eDP ||
+		 drm->connector->connector->connector_type == DRM_MODE_CONNECTOR_LVDS )
+		 return DRM_SCREEN_TYPE_INTERNAL;
+
+	return DRM_SCREEN_TYPE_EXTERNAL;
+}
+
 inline float lerp( float a, float b, float t )
 {
     return a + t * (b - a);
 }
 
+inline uint16_t drm_quantize_lut_value( float flValue )
+{
+	return (uint16_t)quantize( flValue, (float)UINT16_MAX );
+}
+
 inline uint16_t drm_calc_lut_value( float input, float flLinearGain, float flGain, float flBlend )
 {
     float flValue = lerp( flGain * input, linear_to_srgb( flLinearGain * srgb_to_linear( input ) ), flBlend );
-	return (uint16_t)quantize( flValue, (float)UINT16_MAX );
+	return drm_quantize_lut_value( flValue );
 }
 
 bool drm_update_color_mtx(struct drm_t *drm)
@@ -1572,6 +1845,15 @@ bool drm_update_color_mtx(struct drm_t *drm)
 	return true;
 }
 
+static float safe_pow(float x, float y)
+{
+	// Avoids pow(x, 1.0f) != x.
+	if (y == 1.0f)
+		return x;
+
+	return pow(x, y);
+}
+
 bool drm_update_gamma_lut(struct drm_t *drm)
 {
 	if ( !drm->crtc->has_gamma_lut )
@@ -1583,6 +1865,9 @@ bool drm_update_gamma_lut(struct drm_t *drm)
 		drm->pending.color_linear_gain[0] == drm->current.color_linear_gain[0] &&
 		drm->pending.color_linear_gain[1] == drm->current.color_linear_gain[1] &&
 		drm->pending.color_linear_gain[2] == drm->current.color_linear_gain[2] &&
+		drm->pending.color_gamma_exponent[0] == drm->current.color_gamma_exponent[0] &&
+		drm->pending.color_gamma_exponent[1] == drm->current.color_gamma_exponent[1] &&
+		drm->pending.color_gamma_exponent[2] == drm->current.color_gamma_exponent[2] &&
 		drm->pending.gain_blend == drm->current.gain_blend )
 	{
 		return true;
@@ -1598,7 +1883,12 @@ bool drm_update_gamma_lut(struct drm_t *drm)
 		  drm->pending.color_linear_gain[1] == 1.0f &&
 		  drm->pending.color_linear_gain[2] == 1.0f );
 
-	if ( color_gain_identity && linear_gain_identity )
+	bool gamma_exponent_identity =
+		( drm->pending.color_gamma_exponent[0] == 1.0f &&
+		  drm->pending.color_gamma_exponent[1] == 1.0f &&
+		  drm->pending.color_gamma_exponent[2] == 1.0f );
+
+	if ( color_gain_identity && linear_gain_identity && gamma_exponent_identity )
 	{
 		drm->pending.gamma_lut_id = 0;
 		return true;
@@ -1609,9 +1899,14 @@ bool drm_update_gamma_lut(struct drm_t *drm)
 	for ( int i = 0; i < lut_entries; i++ )
 	{
         float input = float(i) / float(lut_entries - 1);
-		gamma_lut[i].red   = drm_calc_lut_value( input, drm->pending.color_linear_gain[0], drm->pending.color_gain[0], drm->pending.gain_blend );
-		gamma_lut[i].green = drm_calc_lut_value( input, drm->pending.color_linear_gain[1], drm->pending.color_gain[1], drm->pending.gain_blend );
-		gamma_lut[i].blue  = drm_calc_lut_value( input, drm->pending.color_linear_gain[2], drm->pending.color_gain[2], drm->pending.gain_blend );
+
+		float r_exp = safe_pow( input, drm->pending.color_gamma_exponent[0] );
+		float g_exp = safe_pow( input, drm->pending.color_gamma_exponent[1] );
+		float b_exp = safe_pow( input, drm->pending.color_gamma_exponent[2] );
+
+		gamma_lut[i].red   = drm_calc_lut_value( r_exp, drm->pending.color_linear_gain[0], drm->pending.color_gain[0], drm->pending.gain_blend );
+		gamma_lut[i].green = drm_calc_lut_value( g_exp, drm->pending.color_linear_gain[1], drm->pending.color_gain[1], drm->pending.gain_blend );
+		gamma_lut[i].blue  = drm_calc_lut_value( b_exp, drm->pending.color_linear_gain[2], drm->pending.color_gain[2], drm->pending.gain_blend );
 	}
 
 	uint32_t blob_id = 0;	
@@ -1624,6 +1919,54 @@ bool drm_update_gamma_lut(struct drm_t *drm)
 	delete[] gamma_lut;
 
 	drm->pending.gamma_lut_id = blob_id;
+
+	return true;
+}
+
+bool drm_update_degamma_lut(struct drm_t *drm)
+{
+	if ( !drm->crtc->has_degamma_lut )
+		return true;
+
+	if (drm->pending.color_degamma_exponent[0] == drm->current.color_degamma_exponent[0] &&
+		drm->pending.color_degamma_exponent[1] == drm->current.color_degamma_exponent[1] &&
+		drm->pending.color_degamma_exponent[2] == drm->current.color_degamma_exponent[2])
+	{
+		return true;
+	}
+
+	bool degamma_exponent_identity =
+		( drm->pending.color_degamma_exponent[0] == 1.0f &&
+		  drm->pending.color_degamma_exponent[1] == 1.0f &&
+		  drm->pending.color_degamma_exponent[2] == 1.0f );
+
+	if ( degamma_exponent_identity )
+	{
+		drm->pending.degamma_lut_id = 0;
+		return true;
+	}
+
+	const int lut_entries = drm->crtc->initial_prop_values["DEGAMMA_LUT_SIZE"];
+	drm_color_lut *degamma_lut = new drm_color_lut[lut_entries];
+	for ( int i = 0; i < lut_entries; i++ )
+	{
+        float input = float(i) / float(lut_entries - 1);
+
+		degamma_lut[i].red   = drm_quantize_lut_value( safe_pow( input, drm->pending.color_degamma_exponent[0] ) );
+		degamma_lut[i].green = drm_quantize_lut_value( safe_pow( input, drm->pending.color_degamma_exponent[1] ) );
+		degamma_lut[i].blue  = drm_quantize_lut_value( safe_pow( input, drm->pending.color_degamma_exponent[2] ) );
+	}
+
+	uint32_t blob_id = 0;	
+	if (drmModeCreatePropertyBlob(drm->fd, degamma_lut,
+			lut_entries * sizeof(struct drm_color_lut), &blob_id) != 0) {
+		drm_log.errorf_errno("Unable to create degamma LUT property blob");
+		delete[] degamma_lut;
+		return false;
+	}
+	delete[] degamma_lut;
+
+	drm->pending.degamma_lut_id = blob_id;
 
 	return true;
 }
@@ -1655,54 +1998,6 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 	return true;
 }
 
-#define EDID_ID(a, b, c) (((a & 0x1f) << 10) | ((b & 0x1f) << 5) | (c & 0x1f))
-
-struct edid_data_t
-{
-	uint16_t make;
-	char model[16];
-	char serial[16];
-};
-
-// from wlroots... mostly
-void parse_edid(edid_data_t *output, const uint8_t *data, size_t len) {
-	if (!data || len < 128) {
-		output->make = 0;
-		snprintf(output->model, sizeof(output->model), "<Unknown>");
-		return;
-	}
-
-	output->make = (data[8] << 8) | data[9];
-
-	uint16_t model = data[10] | (data[11] << 8);
-	snprintf(output->model, sizeof(output->model), "0x%04X", model);
-
-	uint32_t serial = data[12] | (data[13] << 8) | (data[14] << 8) | (data[15] << 8);
-	snprintf(output->serial, sizeof(output->serial), "0x%08X", serial);
-
-	for (size_t i = 72; i <= 108; i += 18) {
-		uint16_t flag = (data[i] << 8) | data[i + 1];
-		if (flag == 0 && data[i + 3] == 0xFC) {
-			sprintf(output->model, "%.13s", &data[i + 5]);
-
-			// Monitor names are terminated by newline if they're too short
-			char *nl = strchr(output->model, '\n');
-			if (nl) {
-				*nl = '\0';
-			}
-		} else if (flag == 0 && data[i + 3] == 0xFF) {
-			sprintf(output->serial, "%.13s", &data[i + 5]);
-
-			// Monitor serial numbers are terminated by newline if they're too
-			// short
-			char *nl = strchr(output->serial, '\n');
-			if (nl) {
-				*nl = '\0';
-			}
-		}
-	}
-}
-
 bool drm_set_refresh( struct drm_t *drm, int refresh )
 {
 	int width = g_nOutputWidth;
@@ -1730,28 +2025,13 @@ bool drm_set_refresh( struct drm_t *drm, int refresh )
 			break;
 		case DRM_MODE_GENERATE_FIXED:
 			{
-				bool is_steam_deck_display = false;
-				if ( drm->connector->props.find( "EDID" ) != drm->connector->props.end() )
-				{
-					uint64_t blob_id = drm->connector->initial_prop_values["EDID"];
-
-					drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(drm->fd, blob_id);
-					if (blob) {
-						edid_data_t edid_data = {};
-						parse_edid( &edid_data, (const unsigned char *)blob->data, blob->length );
-
-						is_steam_deck_display = 
-							( edid_data.make == EDID_ID( 'W', 'L', 'C' ) && !strncmp( edid_data.model, "ANX7530 U", sizeof( edid_data.model ) ) ) ||
-							( edid_data.make == EDID_ID( 'A', 'N', 'X' ) && !strncmp( edid_data.model, "ANX7530 U", sizeof( edid_data.model ) ) ) ||
-							( edid_data.make == EDID_ID( 'V', 'L', 'V' ) && !strncmp( edid_data.model, "Jupiter", sizeof( edid_data.model ) ) );
-
-						drmModeFreePropertyBlob(blob);
-					}
-					else
-					{
-						drm_log.errorf_errno("drmModeGetPropertyBlob(EDID) failed");
-					}
-				}
+				const char *make_pnp = drm->connector->make_pnp;
+				const char *model = drm->connector->model;
+				bool is_steam_deck_display =
+					(strcmp(make_pnp, "WLC") == 0 && strcmp(model, "ANX7530 U") == 0) ||
+					(strcmp(make_pnp, "ANX") == 0 && strcmp(model, "ANX7530 U") == 0) ||
+					(strcmp(make_pnp, "VLV") == 0 && strcmp(model, "ANX7530 U") == 0) ||
+					(strcmp(make_pnp, "VLV") == 0 && strcmp(model, "Jupiter") == 0);
 
 				const drmModeModeInfo *preferred_mode = find_mode(connector, 0, 0, 0);
 				generate_fixed_mode( &mode, preferred_mode, refresh, is_steam_deck_display );

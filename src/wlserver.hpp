@@ -34,7 +34,7 @@ public:
 	bool is_xwayland_ready() const;
 	const char *get_nested_display_name() const;
 
-	void set_wl_id( struct wlserver_surface *surf, long id );
+	void set_wl_id( struct wlserver_surface *surf, uint32_t id );
 
 	_XDisplay *get_xdisplay();
 
@@ -152,7 +152,19 @@ void wlserver_mousemotion( int x, int y, uint32_t time );
 void wlserver_mousebutton( int button, bool press, uint32_t time );
 void wlserver_mousewheel( int x, int y, uint32_t time );
 
+void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time );
+void wlserver_touchdown( double x, double y, int touch_id, uint32_t time );
+void wlserver_touchup( int touch_id, uint32_t time );
+
 void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *when );
+
+struct wlserver_output_info {
+	const char *name;
+	const char *description;
+	int phys_width, phys_height; // millimeters
+};
+
+void wlserver_set_output_info( const wlserver_output_info *info );
 
 gamescope_xwayland_server_t *wlserver_get_xwayland_server( size_t index );
 const char *wlserver_get_wl_display_name( void );
@@ -162,13 +174,15 @@ struct wlserver_surface
 	std::atomic<struct wlr_surface *> wlr;
 
 	// owned by wlserver
-	long wl_id, x11_id;
+	uint32_t wl_id, x11_id;
 	bool overridden;
 	struct wl_list pending_link;
 	struct wl_listener destroy;
+
+	gamescope_xwayland_server_t *xwayland_server;
 };
 
-void wlserver_surface_init( struct wlserver_surface *surf, long x11_id );
+void wlserver_surface_init( struct wlserver_surface *surf, gamescope_xwayland_server_t *server, uint32_t x11_id );
 void wlserver_surface_finish( struct wlserver_surface *surf );
 
 void wlserver_set_xwayland_server_mode( size_t idx, int w, int h, int refresh );

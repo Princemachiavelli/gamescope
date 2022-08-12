@@ -75,7 +75,7 @@ if run_command(glsl_compiler, ['--version', '--depfile', 'dummy.dep'], check: fa
     glsl_compiler,
     output    : ['@BASENAME@.h'],
     arguments : ['-V', '@INPUT@', '--vn', '@BASENAME@', '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', '--quiet'],
-    depfile   : '@DEPFILE@',
+    depfile   : '@BASENAME@.h.d',
   )
 else
   glsl_generator = generator(
@@ -101,7 +101,7 @@ spirv_shaders = glsl_generator.process(shader_src)
 
 liftoff_dep = dependency(
   'libliftoff',
-  version: ['>= 0.2.0', '< 0.3.0'],
+  version: ['>= 0.3.0', '< 0.4.0'],
   fallback: ['libliftoff', 'liftoff'],
   default_options: ['default_library=static'],
 )

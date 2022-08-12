@@ -11,7 +11,7 @@ It also runs on top of a regular desktop, the 'nested' usecase steamcompmgr didn
  - Because the game is running in its own personal Xwayland sandbox desktop, it can't interfere with your desktop and your desktop can't interfere with it.
  - You can spoof a virtual screen with a desired resolution and refresh rate as the only thing the game sees, and control/resize the output as needed. This can be useful in exotic display configurations like ultrawide or multi-monitor setups that involve rotation.
 
-It runs on Mesa + AMD or Intel, and could be made to run on other Mesa/DRM drivers with minimal work. AMD requires Mesa 20.3+, Intel requires Mesa 21.2+. Can support NVIDIA if/when they support atomic KMS + accelerated Xwayland + Vulkan DMA-BUF extensions.
+It runs on Mesa + AMD or Intel, and could be made to run on other Mesa/DRM drivers with minimal work. AMD requires Mesa 20.3+, Intel requires Mesa 21.2+. For NVIDIA's proprietary driver, version 515.43.04+ is required (make sure the `nvidia-drm.modeset=1` kernel parameter is set).
 
 If running RadeonSI clients with older cards (GFX8 and below), currently have to set `R600_DEBUG=nodcc`, or corruption will be observed until the stack picks up DRM modifiers support.
 
@@ -33,7 +33,7 @@ meson install -C build/ --skip-subprojects
 ## Keyboard shortcuts
 
 * **Super + F** : Toggle fullscreen
-* **Super + N** : Toggle integer scaling
+* **Super + N** : Toggle nearest neighbour filtering
 * **Super + U** : Toggle FSR upscaling
 * **Super + Y** : Toggle NIS upscaling
 * **Super + I** : Increase FSR sharpness by 1
@@ -46,7 +46,7 @@ On any X11 or Wayland desktop, you can set the Steam launch arguments of your ga
 
 ```sh
 # Upscale a 720p game to 1440p with integer scaling
-gamescope -h 720 -H 1440 -n -- %command%
+gamescope -h 720 -H 1440 -i -- %command%
 
 # Limit a vsynced game to 30 FPS
 gamescope -r 30 -- %command%
@@ -54,8 +54,6 @@ gamescope -r 30 -- %command%
 # Run the game at 1080p, but scale output to a fullscreen 3440×1440 pillarboxed ultrawide window
 gamescope -w 1920 -h 1080 -W 3440 -H 1440 -b -- %command%
 ```
-
-> **_NOTE:_** If you are running on **NVIDIA**, you will need the `nvidia-drm.modeset=1` kernel parameter.
 
 ## Options
 
@@ -67,6 +65,6 @@ See `gamescope --help` for a full list of options.
 * `-o`: set a frame-rate limit for the game when unfocused. Specified in frames per second. Defaults to unlimited.
 * `-U`: use AMD FidelityFX™ Super Resolution 1.0 for upscaling
 * `-Y`: use NVIDIA Image Scaling v1.0.2 for upscaling
-* `-n`: use integer scaling.
+* `-i`: use integer scaling.
 * `-b`: create a border-less window.
 * `-f`: create a full-screen window.

@@ -34,6 +34,14 @@ enum BlurMode {
     BLUR_MODE_ALWAYS = 2,
 };
 
+enum EStreamColorspace : int
+{
+	k_EStreamColorspace_Unknown = 0,
+	k_EStreamColorspace_BT601 = 1,
+	k_EStreamColorspace_BT601_Full = 2,
+	k_EStreamColorspace_BT709 = 3,
+	k_EStreamColorspace_BT709_Full = 4
+};
 
 #include "drm.hpp"
 
@@ -50,6 +58,7 @@ extern "C" {
 #undef static
 }
 
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <drm_fourcc.h>
 
@@ -92,6 +101,7 @@ public:
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0 );
+	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format );
 
 	inline VkImageView view( bool linear ) { return linear ? m_linearView : m_srgbView; }
 	inline VkImageView linearView() { return m_linearView; }
@@ -106,6 +116,8 @@ public:
 	inline VkFormat format() { return m_format; }
 	inline const struct wlr_dmabuf_attributes& dmabuf() { return m_dmabuf; }
 	inline VkImage vkImage() { return m_vkImage; }
+	inline bool swapchainImage() { return m_vkImageMemory == VK_NULL_HANDLE; }
+	inline bool externalImage() { return m_bExternal; }
 
 	int memoryFence();
 
@@ -114,6 +126,7 @@ public:
 
 private:
 	bool m_bInitialized = false;
+	bool m_bExternal = false;
 
 	VkImage m_vkImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_vkImageMemory = VK_NULL_HANDLE;
@@ -166,8 +179,22 @@ struct FrameInfo_t
 		bool blackBorder;
 		bool linearFilter;
 
+		bool isYcbcr() const
+		{
+			if ( !tex )
+				return false;
+
+			return tex->format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+		}
+
 		uint32_t integerWidth() const { return tex->width() / scale.x; }
 		uint32_t integerHeight() const { return tex->height() / scale.y; }
+		vec2_t offsetPixelCenter() const
+		{
+			float x = offset.x + 0.5f / scale.x;
+			float y = offset.y + 0.5f / scale.y;
+			return { x, y };
+		}
 	} layers[ k_nMaxLayers ];
 
 	uint32_t borderMask() const {
@@ -183,20 +210,12 @@ struct FrameInfo_t
 		uint32_t result = 0;
 		for (int i = 0; i < layerCount; i++)
 		{
-			if ( layers[ i ].tex )
-			{
-				if (layers[ i ].tex->format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
-					result |= 1 << i;
-			}
+			if (layers[ i ].isYcbcr())
+				result |= 1 << i;
 		}
 		return result;
 	}
 };
-
-extern bool g_vulkanSupportsModifiers;
-
-extern bool g_vulkanHasDrmPrimaryDevId;
-extern dev_t g_vulkanDrmPrimaryDevId;
 
 extern bool g_bIsCompositeDebug;
 
@@ -208,7 +227,7 @@ std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dm
 std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 std::shared_ptr<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf );
 
-bool vulkan_composite( struct FrameInfo_t *frameInfo, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
+bool vulkan_composite( const struct FrameInfo_t *frameInfo, std::shared_ptr<CVulkanTexture> pScreenshotTexture );
 std::shared_ptr<CVulkanTexture> vulkan_get_last_output_image( void );
 std::shared_ptr<CVulkanTexture> vulkan_acquire_screenshot_texture(bool exportable);
 
@@ -218,5 +237,8 @@ void vulkan_garbage_collect( void );
 bool vulkan_remake_swapchain( void );
 bool vulkan_remake_output_images( void );
 bool acquire_next_image( void );
+
+bool vulkan_primary_dev_id(dev_t *id);
+bool vulkan_supports_modifiers(void);
 
 struct wlr_renderer *vulkan_renderer_create( void );
